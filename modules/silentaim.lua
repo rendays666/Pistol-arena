@@ -1,10 +1,7 @@
 --[[
-    MODULE: SilentAim v2 — adaptive payload modifier
-    - Cari remote "Shoot" via scan (bukan string match)
-    - Deteksi Vector3 direction berdasarkan magnitude ~ 1 (adaptive)
-    - Support nested table (Header/Body style)
-    - Verbose logging ke console
-    - Test button untuk verifikasi
+    MODULE: SilentAim v2 — verbose logging
+    Hook SEMUA FireServer yang namanya mengandung: shoot/fire/attack/hit/damage
+    Log setiap intercept supaya kelihatan mechanisme aslinya.
 ]]
 
 local SilentAim = {}
@@ -12,7 +9,7 @@ SilentAim.Config = {
     Enabled     = false,
     TeamCheck   = false,
     MaxDistance = 500,
-    SafetyAngle = 90,
+    SafetyAngle = 180,   -- default longgar biar kelihatan work atau nggak
     LogPayload  = true,
 }
 
@@ -21,74 +18,12 @@ local LocalPlayer = Players.LocalPlayer
 local Camera      = workspace.CurrentCamera
 
 local log = function() end
-local hooked = false
-local oldNamecall
-local loggedPayload = false
-local rejectedCount = 0
-local hitsSinceAttach = 0
-local interceptCount = 0
-local modifyCount    = 0
-local shootRemote    = nil  -- reference ke remote yang terdeteksi
-local remoteCandidates = {}
+local hooked, oldNamecall = false, nil
+local loggedShapes = {}
+local rejectedCount, confirmedCount = 0, 0
+local interceptCount, redirectOK, redirectFail = 0, 0, 0
 
--- ─── DETEKSI REMOTE ──────────────────────────────────────────
-local function scanShootRemotes()
-    remoteCandidates = {}
-    local RS = game.ReplicatedStorage
-    local containers = {
-        RS:FindFirstChild("Events") and RS.Events:FindFirstChild("RemoteEvents"),
-        RS:FindFirstChild("Remotes"),
-        RS,
-    }
-    local seen = {}
-    local function addRemote(inst)
-        if seen[inst] then return end
-        seen[inst] = true
-        if inst:IsA("RemoteEvent") then
-            local n = inst.Name:lower()
-            if n:find("shoot") or n:find("fire") or n:find("attack")
-               or n:find("bullet") or n:find("weapon") then
-                table.insert(remoteCandidates, inst)
-            end
-        end
-    end
-    for _, c in ipairs(containers) do
-        if c then
-            for _, ch in ipairs(c:GetChildren()) do addRemote(ch) end
-        end
-    end
-    if #remoteCandidates > 0 then
-        log("SA", "detected shoot remotes: " ..
-            table.concat((function()
-                local names = {}
-                for _, r in ipairs(remoteCandidates) do
-                    table.insert(names, r.Name)
-                end
-                return names
-            end)(), ", "))
-    else
-        log("SA", "WARN: no shoot remote found — hook by generic name")
-    end
-    -- Utamakan "Shoot"
-    for _, r in ipairs(remoteCandidates) do
-        if r.Name:lower() == "shoot" then shootRemote = r; break end
-    end
-    if not shootRemote and #remoteCandidates > 0 then
-        shootRemote = remoteCandidates[1]
-    end
-end
-
-local function isShootRemote(inst)
-    if inst == shootRemote then return true end
-    if typeof(inst) ~= "Instance" then return false end
-    for _, r in ipairs(remoteCandidates) do
-        if inst == r then return true end
-    end
-    local n = (inst.Name or ""):lower()
-    return n == "shoot" or n == "fire" or n == "attack"
-end
-
--- ─── TARGET ──────────────────────────────────────────────────
+-- ─── TARGET SELECTION ────────────────────────────────────────
 local function isEnemy(plr)
     if plr == LocalPlayer then return false end
     if SilentAim.Config.TeamCheck
@@ -100,12 +35,6 @@ end
 local function getBestTarget()
     local best, bestDist = nil, math.huge
     local camPos = Camera.CFrame.Position
-    local filter = {
-        LocalPlayer.Character,
-        Camera,
-        workspace:FindFirstChild("Camera"),
-        workspace:FindFirstChild("Effects"),
-    }
     for _, plr in ipairs(Players:GetPlayers()) do
         if isEnemy(plr) then
             local c = plr.Character
@@ -115,6 +44,9 @@ local function getBestTarget()
                 local d = (head.Position - camPos).Magnitude
                 if d < bestDist and d <= SilentAim.Config.MaxDistance then
                     local ray = Ray.new(camPos, (head.Position - camPos).Unit * d)
+                    local filter = {LocalPlayer.Character, Camera,
+                        workspace:FindFirstChild("Camera"),
+                        workspace:FindFirstChild("Effects")}
                     local hit = workspace:FindPartOnRayWithIgnoreList(ray, filter, false, true)
                     if not hit or hit:IsDescendantOf(c) then
                         bestDist = d; best = plr
@@ -123,62 +55,89 @@ local function getBestTarget()
             end
         end
     end
-    return best
+    return best, bestDist
 end
 
--- ─── ADAPTIVE MODIFY ─────────────────────────────────────────
--- Cari semua field Vector3 dengan magnitude ~ 1 (unit vector) → direction
--- Rekursif untuk nested table (Header/Body style)
-local function modifyDirections(tbl, aimDir, depth, changes)
-    depth = depth or 0
-    changes = changes or {}
-    if depth > 3 then return changes end
-    for k, v in pairs(tbl) do
-        if typeof(v) == "Vector3" then
-            -- Direction = unit vector (magnitude ~ 1)
-            -- Toleransi lebar karena beberapa game pakai "ray direction" non-unit
-            local mag = v.Magnitude
-            if math.abs(mag - 1) < 0.15 then
-                tbl[k] = aimDir
-                table.insert(changes, tostring(k))
-            end
-            -- Kalau ada field Direction/Vector dengan magnitude > 1 (larger magnitude),
-            -- kemungkinan "ray direction * distance". Scale aimDir ke magnitude itu.
-            local nl = tostring(k):lower()
-            if (nl:find("dir") or nl:find("look") or nl:find("vector"))
-               and mag > 1 then
-                tbl[k] = aimDir * mag
-                table.insert(changes, tostring(k).."(scaled)")
-            end
-        elseif type(v) == "table" then
-            local nested = modifyDirections(v, aimDir, depth + 1, {})
-            for _, c in ipairs(nested) do
-                table.insert(changes, tostring(k).."."..c)
-            end
-        end
-    end
-    return changes
-end
-
-local function logPayloadShape(tbl)
-    if loggedPayload or not SilentAim.Config.LogPayload then return end
-    loggedPayload = true
+-- ─── DEBUG SHAPE ────────────────────────────────────────────
+local function describeArgs(args)
     local parts = {}
-    for k, v in pairs(tbl) do
-        local vs = typeof(v)
-        if vs == "Vector3" then
-            vs = string.format("V3(%.2f,%.2f,%.2f)", v.X, v.Y, v.Z)
+    for i = 1, #args do
+        local v = args[i]
+        local t = typeof(v)
+        if t == "Vector3" then
+            parts[#parts+1] = string.format("a%d=V3(%.1f,%.1f,%.1f | mag=%.2f)",
+                i, v.X, v.Y, v.Z, v.Magnitude)
+        elseif t == "CFrame" then
+            parts[#parts+1] = "a"..i.."=CFrame"
+        elseif t == "table" then
+            local keys = {}
+            for k, vv in pairs(v) do
+                local tt = typeof(vv)
+                if tt == "Vector3" then
+                    keys[#keys+1] = tostring(k).."=V3(mag="..
+                        string.format("%.2f", vv.Magnitude)..")"
+                else
+                    keys[#keys+1] = tostring(k).."="..tt
+                end
+            end
+            parts[#parts+1] = "a"..i.."={ "..table.concat(keys, ", ").." }"
+        elseif t == "Instance" then
+            parts[#parts+1] = "a"..i.."=Inst("..(v.Name or "?")..")"
+        else
+            parts[#parts+1] = "a"..i.."="..t..":"..tostring(v):sub(1, 25)
         end
-        table.insert(parts, tostring(k).."="..vs)
     end
-    log("SA", "payload shape: {" .. table.concat(parts, ", ") .. "}")
+    return table.concat(parts, "  ")
 end
 
--- ─── MODIFY ARGS ─────────────────────────────────────────────
+local function logShapeOnce(key, args)
+    if loggedShapes[key] or not SilentAim.Config.LogPayload then return end
+    loggedShapes[key] = true
+    log("SA", "SHAPE["..key.."] = "..describeArgs(args))
+end
+
+-- ─── REDIRECT ───────────────────────────────────────────────
+local function redirectTable(tbl, camPos, aimDir)
+    -- Prioritas: nama field umum
+    local known = {"Direction","direction","Dir","dir","LookDirection",
+                   "AimDir","Vector","Target","target","To","to"}
+    for _, k in ipairs(known) do
+        if typeof(tbl[k]) == "Vector3" then
+            local m = tbl[k].Magnitude
+            if m > 0.5 and m < 3 then
+                tbl[k] = aimDir
+                return tostring(k)
+            end
+        end
+    end
+    -- Fallback: cari Vector3 magnitude ~1
+    for k, v in pairs(tbl) do
+        if typeof(v) == "Vector3" and v.Magnitude > 0.5 and v.Magnitude < 3 then
+            tbl[k] = aimDir
+            return tostring(k).." (auto)"
+        end
+    end
+    return nil
+end
+
 local function modifyArgs(args)
-    if not SilentAim.Config.Enabled then return args end
-    local target = getBestTarget()
-    if not target then return args end
+    interceptCount = interceptCount + 1
+    logShapeOnce("n"..#args, args)
+
+    -- Kalau disabled, tetap log sekali biar keliatan hook jalan
+    if not SilentAim.Config.Enabled then
+        if interceptCount <= 3 then
+            log("SA", "intercept (disabled) "..describeArgs(args))
+        end
+        return args
+    end
+
+    local target, dist = getBestTarget()
+    if not target then
+        redirectFail = redirectFail + 1
+        log("SA", "no target — pass through")
+        return args
+    end
 
     local head = target.Character and target.Character:FindFirstChild("Head")
     if not head then return args end
@@ -190,105 +149,113 @@ local function modifyArgs(args)
     local angle = math.deg(math.acos(dot))
 
     if angle > SilentAim.Config.SafetyAngle then
-        log("SA", string.format("SKIP %.0f°>%.0f°", angle, SilentAim.Config.SafetyAngle))
+        redirectFail = redirectFail + 1
+        log("SA", string.format("SKIP angle %.0f° > %.0f°",
+            angle, SilentAim.Config.SafetyAngle))
         return args
     end
 
-    -- Table style (paling umum)
+    -- Table style
     if type(args[1]) == "table" then
-        logPayloadShape(args[1])
-        local changes = modifyDirections(args[1], aimDir, 0, {})
-        if #changes > 0 then
-            modifyCount = modifyCount + 1
-            log("SA", string.format("OK modify [%s] angle=%.0f°",
-                table.concat(changes, ","), angle))
+        local field = redirectTable(args[1], camPos, aimDir)
+        if field then
+            redirectOK = redirectOK + 1
+            log("SA", string.format("✓ table.%s | %s | %.0f° %.0fm",
+                field, target.Name, angle, dist))
         else
-            log("SA", "WARN no unit Vector3 found in payload")
+            redirectFail = redirectFail + 1
+            log("SA", "✗ table shape unknown")
         end
         return args
     end
 
-    -- Varargs style
-    if #args >= 2 and typeof(args[1]) == "Vector3" and typeof(args[2]) == "Vector3" then
-        args[2] = aimDir
-        modifyCount = modifyCount + 1
-        log("SA", string.format("OK varargs angle=%.0f°", angle))
-        return args
+    -- Varargs style: cari Vector3 magnitude ~1 (direction)
+    local modified, whichArg = false, nil
+    for i = 1, #args do
+        if typeof(args[i]) == "Vector3" then
+            local m = args[i].Magnitude
+            if m > 0.5 and m < 3 then
+                args[i] = aimDir
+                modified = true
+                whichArg = i
+                break
+            end
+        end
     end
 
-    if not loggedPayload then
-        loggedPayload = true
-        local parts = {}
-        for i = 1, #args do
-            table.insert(parts, "a"..i..":"..typeof(args[i]))
-        end
-        log("SA", "WARN unknown payload: " .. table.concat(parts, " "))
+    if modified then
+        redirectOK = redirectOK + 1
+        log("SA", string.format("✓ arg%d=dir | %s | %.0f° %.0fm",
+            whichArg, target.Name, angle, dist))
+    else
+        redirectFail = redirectFail + 1
+        log("SA", "✗ no direction vector in varargs")
     end
+
     return args
 end
 
--- ─── HOOK ────────────────────────────────────────────────────
+-- ─── HOOK ───────────────────────────────────────────────────
 local function installHook()
     if hooked then return true end
     if type(hookmetamethod) ~= "function" or type(getnamecallmethod) ~= "function" then
-        log("ERR", "SilentAim: hookmetamethod missing")
+        log("ERR", "SilentAim: hookmetamethod NOT SUPPORTED di executor ini")
         return false
     end
-
-    scanShootRemotes()
 
     local ok, err = pcall(function()
         oldNamecall = hookmetamethod(game, "__namecall", function(self, ...)
             local method = getnamecallmethod()
-            if method == "FireServer" and typeof(self) == "Instance"
-               and isShootRemote(self) then
-                interceptCount = interceptCount + 1
-                local args = {...}
-                local ok2, res = pcall(modifyArgs, args)
-                if ok2 and res then args = res
-                elseif not ok2 then log("ERR", "SA modify: " .. tostring(res)) end
-                return oldNamecall(self, table.unpack(args))
+            if method == "FireServer" and typeof(self) == "Instance" then
+                local n = (self.Name or ""):lower()
+                if n:find("shoot") or n:find("fire") or n:find("attack")
+                   or n:find("hit") or n:find("damage") then
+                    local args = {...}
+                    local ok2, res = pcall(modifyArgs, args)
+                    if ok2 and res then args = res
+                    elseif not ok2 then log("ERR", "SA modify: "..tostring(res)) end
+                    return oldNamecall(self, table.unpack(args))
+                end
             end
             return oldNamecall(self, ...)
         end)
     end)
 
     if not ok then
-        log("ERR", "SilentAim hook: " .. tostring(err))
+        log("ERR", "SilentAim hook install: "..tostring(err))
         return false
     end
 
-    -- Listen reject/hit events
     pcall(function()
-        local events = game.ReplicatedStorage:FindFirstChild("Events")
-        local RE = events and events:FindFirstChild("RemoteEvents")
+        local Events = game:GetService("ReplicatedStorage"):FindFirstChild("Events")
+        local RE = Events and Events:FindFirstChild("RemoteEvents")
         if RE then
             local rej = RE:FindFirstChild("HitRejected")
             if rej then
                 rej.OnClientEvent:Connect(function()
                     rejectedCount = rejectedCount + 1
-                    log("WARN", "HitRejected #" .. rejectedCount)
-                    if rejectedCount >= 5 and SilentAim.Config.Enabled then
-                        SilentAim.Config.Enabled = false
-                        log("ERR", "SilentAim auto-OFF (5 rejects) — server validate direction")
-                    end
+                    log("WARN", "HitRejected total="..rejectedCount)
                 end)
             end
             local hit = RE:FindFirstChild("ConfirmHit")
             if hit then
-                hit.OnClientEvent:Connect(function() hitsSinceAttach = hitsSinceAttach + 1 end)
+                hit.OnClientEvent:Connect(function()
+                    confirmedCount = confirmedCount + 1
+                end)
             end
         end
     end)
 
     hooked = true
+    log("OK", "SilentAim hook — pattern: shoot/fire/attack/hit/damage")
     return true
 end
 
--- ─── PUBLIC API ──────────────────────────────────────────────
+-- ─── PUBLIC API ─────────────────────────────────────────────
 function SilentAim:Init()
-    local ok = installHook()
-    if ok then log("OK", "SilentAim hook installed") end
+    if installHook() then
+        log("INFO", "SilentAim READY — tembak 1x, lihat log 'SHAPE[...]'")
+    end
 end
 
 function SilentAim:SetLogger(fn) log = fn end
@@ -301,22 +268,19 @@ end
 
 function SilentAim:GetStats()
     return {
-        intercepts = interceptCount,
-        modified = modifyCount,
-        rejected = rejectedCount,
-        confirmed = hitsSinceAttach,
-        remote = shootRemote and shootRemote:GetFullName() or "none",
+        intercepted = interceptCount,
+        redirected  = redirectOK,
+        failed      = redirectFail,
+        rejected    = rejectedCount,
+        confirmed   = confirmedCount,
     }
 end
 
 function SilentAim:ResetStats()
-    rejectedCount = 0
-    hitsSinceAttach = 0
-    interceptCount = 0
-    modifyCount = 0
+    interceptCount, redirectOK, redirectFail = 0, 0, 0
+    rejectedCount, confirmedCount = 0, 0
+    loggedShapes = {}
 end
-
-function SilentAim:GetShootRemote() return shootRemote end
 
 function SilentAim:Destroy()
     if hooked and oldNamecall then
