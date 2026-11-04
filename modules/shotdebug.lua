@@ -1,15 +1,13 @@
 --[[
-    MODULE: ShotDebug
-    - Hook __namecall: log SEMUA FireServer/InvokeServer
-    - Live GUI: crosshair, enemy check, metode fire, counter remote, payload Shoot terakhir
-    - Replay: fire ulang payload terakhir (untuk testing)
-    - Decoder: tampilkan struktur table payload
+    MODULE: ShotDebug v2
+    - Capture SEMUA FireServer/InvokeServer
+    - Log detail + payload (rate-limited)
+    - Expose GetLastCapture(name) dan GetBestShootPayload()
+    - GUI live
 ]]
 
 local ShotDebug = {}
-ShotDebug.Config = {
-    Enabled = true,
-}
+ShotDebug.Config = { Enabled = true }
 
 local Players     = game:GetService("Players")
 local RunService  = game:GetService("RunService")
@@ -19,119 +17,80 @@ local LP          = Players.LocalPlayer
 local PG          = LP:WaitForChild("PlayerGui")
 
 local log = function() end
-
-local capturedCalls   = {}   -- {name, args, time} — max 20 terakhir
-local remoteCallCount = {}   -- [name] = count
-local lastShoot       = nil  -- {remote, args, time}
+local lastCaptures    = {}      -- [name] = {args, time}
+local remoteCallCount = {}      -- [name] = count
+local recentCalls     = {}      -- {name, args, time} max 30
 local hookedNamecall  = false
 local oldNamecall
 local gui, mainFrame, textLabel
 local dragging, dragStart, startPos = false, nil, nil
-local detectedFireButton = nil
-local fireButtonScanAt   = 0
 
--- ─── DETEKSI FIRE BUTTON ─────────────────────────────────────
-local function findFireButton()
-    if tick() - fireButtonScanAt < 3 and detectedFireButton then
-        return detectedFireButton
+-- Rate limit logging
+local logBudget, logBudgetReset = 15, 0
+local function canLog()
+    local now = tick()
+    if now - logBudgetReset > 1 then
+        logBudgetReset = now
+        logBudget = 15
     end
-    fireButtonScanAt = tick()
-    detectedFireButton = nil
-    local guis = {"WeaponGui", "WeaponTouchGui", "HotbarGui"}
-    for _, gname in ipairs(guis) do
-        local g = PG:FindFirstChild(gname)
-        if g then
-            for _, d in ipairs(g:GetDescendants()) do
-                if d:IsA("TextButton") or d:IsA("ImageButton") then
-                    local n = d.Name:lower()
-                    if n:find("fire") or n:find("shoot") or n:find("trigger")
-                       or n:find("attack") then
-                        detectedFireButton = d
-                        return d
-                    end
-                end
-            end
-        end
-    end
-    return nil
+    if logBudget > 0 then logBudget = logBudget - 1; return true end
+    return false
+end
+
+-- Remote yang dianggap "shoot-like"
+local function isShootLike(name)
+    local n = name:lower()
+    return n:find("shoot") or n:find("bullet") or n:find("fire")
+        or n:find("attack") or n:find("hit") or n:find("damage")
+        or n:find("muzzle")
 end
 
 -- ─── DECODE PAYLOAD ─────────────────────────────────────────
-local function decodePayload(args, maxDepth, depth)
-    depth = depth or 1
-    maxDepth = maxDepth or 2
-    if depth > maxDepth then return "..." end
-    if type(args) ~= "table" then
-        if typeof(args) == "Vector3" then
-            return string.format("Vector3(%.1f,%.1f,%.1f)", args.X, args.Y, args.Z)
-        elseif typeof(args) == "CFrame" then
-            return "CFrame"
-        end
-        return tostring(args)
-    end
+local function describeArgs(args)
     local parts = {}
-    local count = 0
-    for k, v in pairs(args) do
-        count = count + 1
-        if count > 8 then table.insert(parts, "..."); break end
-        local vs
-        if type(v) == "table" then
-            vs = "{" .. decodePayload(v, maxDepth, depth + 1) .. "}"
-        elseif typeof(v) == "Vector3" then
-            vs = string.format("V3(%.0f,%.0f,%.0f)", v.X, v.Y, v.Z)
-        elseif typeof(v) == "Instance" then
-            vs = v:GetFullName()
+    for i = 1, math.min(#args, 6) do
+        local v = args[i]
+        local t = typeof(v)
+        if t == "Vector3" then
+            parts[#parts+1] = string.format("a%d=V3(%.2f,%.2f,%.2f|m=%.2f)",
+                i, v.X, v.Y, v.Z, v.Magnitude)
+        elseif t == "CFrame" then
+            parts[#parts+1] = "a"..i.."=CFrame"
+        elseif t == "table" then
+            local ks = {}
+            for k, vv in pairs(v) do
+                if typeof(vv) == "Vector3" then
+                    ks[#ks+1] = tostring(k).."=V3(m=.."..
+                        string.format("%.2f", vv.Magnitude)..")"
+                else
+                    ks[#ks+1] = tostring(k).."="..typeof(vv)
+                end
+            end
+            parts[#parts+1] = "a"..i.."={"..table.concat(ks, ",").."}"
+        elseif t == "Instance" then
+            parts[#parts+1] = "a"..i.."=Inst("..(v.Name or "?")..")"
         else
-            vs = tostring(v)
+            local s = tostring(v)
+            if #s > 20 then s = s:sub(1, 20).."..." end
+            parts[#parts+1] = "a"..i.."="..t..":"..s
         end
-        table.insert(parts, tostring(k) .. "=" .. vs)
     end
-    return table.concat(parts, ", ")
+    return table.concat(parts, "  ")
 end
 
 -- ─── CAPTURE ─────────────────────────────────────────────────
-local function recordCall(name, args)
+local function capture(name, args)
     remoteCallCount[name] = (remoteCallCount[name] or 0) + 1
-    table.insert(capturedCalls, { name = name, args = args, time = tick() })
-    if #capturedCalls > 20 then table.remove(capturedCalls, 1) end
-end
+    lastCaptures[name] = { args = args, time = tick() }
+    table.insert(recentCalls, { name = name, args = args, time = tick() })
+    if #recentCalls > 30 then table.remove(recentCalls, 1) end
 
--- ─── LIVE STATE UNTUK GUI ────────────────────────────────────
-local function getNearestEnemyInfo()
-    local best, bestDist = nil, math.huge
-    local camPos = Camera.CFrame.Position
-    for _, plr in ipairs(Players:GetPlayers()) do
-        if plr ~= LP then
-            local c = plr.Character
-            local head = c and c:FindFirstChild("Head")
-            local hum  = c and c:FindFirstChildOfClass("Humanoid")
-            if head and hum and hum.Health > 0 then
-                local d = (head.Position - camPos).Magnitude
-                if d < bestDist then bestDist = d; best = plr end
-            end
-        end
+    -- Log shoot-like selalu (biar bisa debug), non-shoot rate-limited
+    local shouldLog = isShootLike(name) or canLog()
+    if shouldLog then
+        log("CAP", string.format("[%s] n=%d | %s",
+            name, #args, describeArgs(args)))
     end
-    return best, bestDist
-end
-
-local function isCrosshairOnEnemy()
-    local vp = Camera.ViewportSize
-    local center = Vector2.new(vp.X / 2, vp.Y / 2)
-    for _, plr in ipairs(Players:GetPlayers()) do
-        if plr ~= LP then
-            local c = plr.Character
-            local head = c and c:FindFirstChild("Head")
-            local hum = c and c:FindFirstChildOfClass("Humanoid")
-            if head and hum and hum.Health > 0 then
-                local sp, on = Camera:WorldToViewportPoint(head.Position)
-                if on then
-                    local dx, dy = sp.X - center.X, sp.Y - center.Y
-                    if dx*dx + dy*dy <= 45*45 then return true, plr end
-                end
-            end
-        end
-    end
-    return false, nil
 end
 
 -- ─── GUI ─────────────────────────────────────────────────────
@@ -142,12 +101,11 @@ local function buildGUI()
     gui.Parent = PG
 
     mainFrame = Instance.new("Frame")
-    mainFrame.Size = UDim2.new(0, 300, 0, 320)
-    mainFrame.Position = UDim2.new(0, 8, 0, 60)
+    mainFrame.Size = UDim2.new(0, 300, 0, 340)
+    mainFrame.Position = UDim2.new(0, 8, 0, 55)
     mainFrame.BackgroundColor3 = Color3.fromRGB(10, 10, 20)
     mainFrame.BackgroundTransparency = 0.1
-    mainFrame.BorderSizePixel = 0
-    mainFrame.Active = true
+    mainFrame.BorderSizePixel = 0; mainFrame.Active = true
     mainFrame.Parent = gui
     Instance.new("UICorner", mainFrame).CornerRadius = UDim.new(0, 6)
     local st = Instance.new("UIStroke", mainFrame)
@@ -156,13 +114,12 @@ local function buildGUI()
     local titleBar = Instance.new("Frame")
     titleBar.Size = UDim2.new(1, 0, 0, 24)
     titleBar.BackgroundColor3 = Color3.fromRGB(30, 15, 15)
-    titleBar.BorderSizePixel = 0
-    titleBar.Parent = mainFrame
+    titleBar.BorderSizePixel = 0; titleBar.Parent = mainFrame
     Instance.new("UICorner", titleBar).CornerRadius = UDim.new(0, 6)
 
     local tLabel = Instance.new("TextLabel")
     tLabel.Size = UDim2.new(1, -50, 1, 0); tLabel.Position = UDim2.new(0, 8, 0, 0)
-    tLabel.BackgroundTransparency = 1; tLabel.Text = "SHOT DEBUG"
+    tLabel.BackgroundTransparency = 1; tLabel.Text = "SHOT DEBUG v2"
     tLabel.TextColor3 = Color3.fromRGB(255, 150, 100); tLabel.TextSize = 11
     tLabel.Font = Enum.Font.GothamBold; tLabel.TextXAlignment = Enum.TextXAlignment.Left
     tLabel.Parent = titleBar
@@ -191,14 +148,13 @@ local function buildGUI()
     textLabel.BackgroundTransparency = 1
     textLabel.Text = "Starting..."
     textLabel.TextColor3 = Color3.fromRGB(180, 255, 180)
-    textLabel.TextSize = 10; textLabel.Font = Enum.Font.Code
+    textLabel.TextSize = 9; textLabel.Font = Enum.Font.Code
     textLabel.TextXAlignment = Enum.TextXAlignment.Left
     textLabel.TextYAlignment = Enum.TextYAlignment.Top
     textLabel.TextWrapped = true
     textLabel.AutomaticSize = Enum.AutomaticSize.Y
     textLabel.Parent = scroll
 
-    -- Dragging
     titleBar.InputBegan:Connect(function(i)
         if i.UserInputType == Enum.UserInputType.Touch or i.UserInputType == Enum.UserInputType.MouseButton1 then
             dragging = true; dragStart = i.Position; startPos = mainFrame.Position
@@ -219,65 +175,50 @@ local function buildGUI()
     end)
 end
 
--- ─── REFRESH GUI (tiap 0.25s) ───────────────────────────────
 local function refreshGUI()
     if not textLabel or not gui or not gui.Enabled then return end
     local lines = {}
 
-    -- Target
-    local plr, dist = getNearestEnemyInfo()
-    local onEnemy = isCrosshairOnEnemy()
-    table.insert(lines, "── TARGET ──")
-    if plr then
-        table.insert(lines, string.format("%s  %.0fm  %s",
-            plr.Name, dist, onEnemy and "[ON-XHAIR]" or ""))
-    else
-        table.insert(lines, "(no enemy)")
-    end
+    -- OnMap status
+    local onMap = LP:GetAttribute("OnMap")
+    table.insert(lines, "── STATUS ──")
+    table.insert(lines, "OnMap: " .. tostring(onMap))
+    table.insert(lines, "HP: " .. (LP.Character and LP.Character:FindFirstChildOfClass("Humanoid") and
+        math.floor(LP.Character:FindFirstChildOfClass("Humanoid").Health) or "?"))
 
-    -- Fire Methods
-    table.insert(lines, "── FIRE METHODS ──")
-    local vimOk = false
-    pcall(function() vimOk = game:GetService("VirtualInputManager") ~= nil end)
-    table.insert(lines, string.format("VIM:%s  m1click:%s  m1press:%s",
-        vimOk and "OK" or "X",
-        type(mouse1click) == "function" and "OK" or "X",
-        type(mouse1press) == "function" and "OK" or "X"))
-    local fb = findFireButton()
-    table.insert(lines, "Btn: " .. (fb and (fb:GetFullName():sub(-40)) or "NOT FOUND"))
-
-    -- Remote Calls
-    table.insert(lines, "── REMOTE CALLS ──")
-    local names = {}
-    for n in pairs(remoteCallCount) do table.insert(names, n) end
-    table.sort(names, function(a, b) return remoteCallCount[a] > remoteCallCount[b] end)
-    if #names == 0 then
-        table.insert(lines, "(belum ada panggilan remote)")
-    else
-        for i = 1, math.min(#names, 8) do
-            local n = names[i]
-            local marker = (n == "Shoot") and " ★" or ""
-            table.insert(lines, string.format("%s x%d%s", n, remoteCallCount[n], marker))
+    -- Shoot remotes captured
+    table.insert(lines, "── SHOOT CAPTURED ──")
+    local shootFound = false
+    for name, info in pairs(lastCaptures) do
+        if isShootLike(name) then
+            shootFound = true
+            local ago = tick() - info.time
+            table.insert(lines, string.format("%s x%d (%.1fs|n=%d)",
+                name, remoteCallCount[name] or 0, ago, #info.args))
+            table.insert(lines, "  " .. describeArgs(info.args))
         end
     end
-
-    -- Last Shoot Payload
-    table.insert(lines, "── LAST SHOOT ──")
-    if lastShoot then
-        local ago = tick() - lastShoot.time
-        table.insert(lines, string.format("%.1fs ago, %d args", ago, #lastShoot.args))
-        table.insert(lines, "Payload:")
-        table.insert(lines, decodePayload(lastShoot.args, 3))
-    else
-        table.insert(lines, "Belum ada. Tembak 1x manual.")
+    if not shootFound then
+        table.insert(lines, "Belum ada. Tembak 3x manual.")
     end
 
-    -- Recent calls
+    -- All remotes
+    table.insert(lines, "── ALL REMOTES (top 8) ──")
+    local names = {}
+    for n in pairs(remoteCallCount) do table.insert(names, n) end
+    table.sort(names, function(a,b) return remoteCallCount[a] > remoteCallCount[b] end)
+    for i = 1, math.min(#names, 8) do
+        local n = names[i]
+        local marker = isShootLike(n) and " ★" or ""
+        table.insert(lines, string.format("%s x%d%s", n, remoteCallCount[n], marker))
+    end
+
+    -- Recent 5
     table.insert(lines, "── RECENT (5) ──")
-    local start = math.max(1, #capturedCalls - 4)
-    for i = start, #capturedCalls do
-        local c = capturedCalls[i]
-        table.insert(lines, string.format("%.1fs %s(%d)",
+    local start = math.max(1, #recentCalls - 4)
+    for i = start, #recentCalls do
+        local c = recentCalls[i]
+        table.insert(lines, string.format("%.1fs %s(n=%d)",
             tick() - c.time, c.name, #c.args))
     end
 
@@ -297,27 +238,15 @@ local function installHook()
             local method = getnamecallmethod()
             if method == "FireServer" or method == "InvokeServer" then
                 local args = {...}
-                local name = "?"
-                if typeof(self) == "Instance" then
-                    name = self.Name or "?"
-                end
-
-                -- record semua
-                pcall(recordCall, name, args)
-
-                -- shoot special handling
-                if name == "Shoot" or name == "Fire" or name == "Attack" then
-                    lastShoot = { remote = self, args = args, time = tick(), name = name }
-                    pcall(log, "INFO", string.format("ShotDebug captured [%s] args=%d: %s",
-                        name, #args, decodePayload(args)))
-                end
+                local name = typeof(self) == "Instance" and (self.Name or "?") or "?"
+                pcall(capture, name, args)
             end
             return oldNamecall(self, ...)
         end)
     end)
 
     if not ok then
-        log("ERR", "ShotDebug hook install: " .. tostring(err))
+        log("ERR", "ShotDebug hook: " .. tostring(err))
         return false
     end
     hookedNamecall = true
@@ -327,9 +256,7 @@ end
 -- ─── PUBLIC API ──────────────────────────────────────────────
 function ShotDebug:Init()
     buildGUI()
-    local ok = installHook()
-    if ok then log("OK", "ShotDebug hook installed") end
-
+    if installHook() then log("OK", "ShotDebug v2 hook installed") end
     task.spawn(function()
         while gui and gui.Parent do
             task.wait(0.25)
@@ -339,44 +266,80 @@ function ShotDebug:Init()
 end
 
 function ShotDebug:SetLogger(fn) log = fn end
+function ShotDebug:ToggleGUI() if gui then gui.Enabled = not gui.Enabled end end
+function ShotDebug:ClearStats()
+    remoteCallCount, recentCalls = {}, {}
+    log("INFO", "ShotDebug cleared")
+end
 
-function ShotDebug:GetLastShoot() return lastShoot end
+function ShotDebug:GetLastCapture(name)
+    return lastCaptures[name]
+end
 
-function ShotDebug:GetCallCount(name) return remoteCallCount[name] or 0 end
+function ShotDebug:GetAllRemoteNames()
+    local names = {}
+    for n in pairs(lastCaptures) do table.insert(names, n) end
+    return names
+end
+
+-- Cari payload shoot terbaik:
+-- Prioritas: Shoot → ReplicateFakeBullet → Fire/Attack → apapun yang shoot-like
+function ShotDebug:GetBestShootPayload()
+    local priority = { "Shoot", "ReplicateFakeBullet", "Fire", "Attack" }
+    for _, n in ipairs(priority) do
+        if lastCaptures[n] then
+            return { name = n, args = lastCaptures[n].args }
+        end
+    end
+    -- Fallback: apapun yang shoot-like
+    for n, info in pairs(lastCaptures) do
+        if isShootLike(n) then
+            return { name = n, args = info.args }
+        end
+    end
+    return nil
+end
 
 function ShotDebug:ReplayShoot()
-    if not lastShoot then
-        log("WARN", "ReplayShoot: tidak ada payload tersimpan")
+    local best = self:GetBestShootPayload()
+    if not best then
+        log("WARN", "ReplayShoot: belum ada payload — tembak 3x manual dulu")
+        return false
+    end
+    local remote
+    local RE = game:GetService("ReplicatedStorage"):FindFirstChild("Events")
+    local REs = RE and RE:FindFirstChild("RemoteEvents")
+    if REs then
+        remote = REs:FindFirstChild(best.name)
+    end
+    if not remote then
+        log("ERR", "ReplayShoot: remote '"..best.name.."' tidak ditemukan")
         return false
     end
     local ok, err = pcall(function()
-        lastShoot.remote:FireServer(table.unpack(lastShoot.args))
+        remote:FireServer(table.unpack(best.args))
     end)
     if not ok then
-        log("ERR", "ReplayShoot: " .. tostring(err))
+        log("ERR", "ReplayShoot: "..tostring(err))
         return false
     end
-    log("OK", "ReplayShoot: fired " .. lastShoot.name)
+    log("OK", "ReplayShoot: fired "..best.name.." n="..#best.args)
     return true
 end
 
-function ShotDebug:ReplayShootModified(newArgs)
-    if not lastShoot then return false end
-    local ok, err = pcall(function()
-        lastShoot.remote:FireServer(table.unpack(newArgs))
+function ShotDebug:ReplayShootModified(newArgs, remoteName)
+    local best = remoteName and { name = remoteName, args = newArgs }
+        or self:GetBestShootPayload()
+    if not best then return false end
+    local RE = game:GetService("ReplicatedStorage"):FindFirstChild("Events")
+    local REs = RE and RE:FindFirstChild("RemoteEvents")
+    if not REs then return false end
+    local remote = REs:FindFirstChild(best.name)
+    if not remote then return false end
+    local ok = pcall(function()
+        remote:FireServer(table.unpack(newArgs or best.args))
     end)
-    if not ok then log("ERR", "ReplayModified: " .. tostring(err)); return false end
-    return true
-end
-
-function ShotDebug:ClearStats()
-    remoteCallCount = {}
-    capturedCalls = {}
-    log("INFO", "ShotDebug: stats cleared")
-end
-
-function ShotDebug:ToggleGUI()
-    if gui then gui.Enabled = not gui.Enabled end
+    return ok
 end
 
 function ShotDebug:Destroy()
