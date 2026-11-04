@@ -1,17 +1,17 @@
 --[[
-    MODULE: AutoFire v2
-    Fallback chain: VIM → mouse1click → mouse1press → ReplayCached → FireButton
-    Jika tidak ada satupun yang kerja, pakai silent tap + replay manual.
+    MODULE: AutoFire v3
+    Priority: replay (via ShotDebug payload) → vim → mouse1 → button
+    Replay = paling reliable karena langsung pakai payload ReplicateFakeBullet yg confirmed ada.
 ]]
 
 local AutoFire = {}
 AutoFire.Config = {
     Enabled        = false,
-    FireDelay      = 0.08,
-    CheckRadius    = 45,
+    FireDelay      = 0.12,
+    CheckRadius    = 55,
     OnlyWhenAimbot = false,
     TeamCheck      = false,
-    Method         = "auto",  -- "auto" | "vim" | "mouse1" | "replay" | "button"
+    Method         = "auto",
 }
 
 local Players     = game:GetService("Players")
@@ -25,6 +25,7 @@ local renderConn = nil
 local lastFire = 0
 local activeMethod = "NONE"
 local aimbotLockFn = nil
+local fireCount = 0
 
 -- ─── DETEKSI ─────────────────────────────────────────────────
 local function detectVIM()
@@ -35,140 +36,131 @@ local function detectVIM()
     end)
 end
 
-local function detectFireButton()
-    if not ShotDebugRef then return nil end
-    -- fallback: cari manual
-    local PG = LP:FindFirstChild("PlayerGui")
-    if not PG then return nil end
-    for _, gname in ipairs({"WeaponGui", "WeaponTouchGui"}) do
-        local g = PG:FindFirstChild(gname)
-        if g then
-            for _, d in ipairs(g:GetDescendants()) do
-                if d:IsA("TextButton") or d:IsA("ImageButton") then
-                    local n = d.Name:lower()
-                    if n:find("fire") or n:find("shoot") or n:find("trigger") then
-                        return d
-                    end
-                end
-            end
-        end
-    end
-    return nil
-end
-
 local function detectMethods()
     local list = {}
+    if ShotDebugRef and ShotDebugRef:GetBestShootPayload() then
+        table.insert(list, "replay")
+    end
     if detectVIM() then table.insert(list, "VIM") end
     if type(mouse1click) == "function" then table.insert(list, "mouse1click") end
     if type(mouse1press) == "function" and type(mouse1release) == "function" then
         table.insert(list, "mouse1press")
     end
-    if ShotDebugRef and ShotDebugRef:GetLastShoot() then table.insert(list, "replay") end
-    if detectFireButton() then table.insert(list, "button") end
     return list
 end
 
 -- ─── FIRE METHODS ────────────────────────────────────────────
-local function fireVIM()
-    local VIM = game:GetService("VirtualInputManager")
-    local vp = Camera.ViewportSize
-    local x, y = vp.X / 2, vp.Y / 2
-    VIM:SendMouseButtonEvent(x, y, 0, true, 1, game, 0)
-    task.wait(0.01)
-    VIM:SendMouseButtonEvent(x, y, 0, false, 1, game, 0)
-    return true
-end
-
-local function fireMouse1Click()
-    mouse1click()
-    return true
-end
-
-local function fireMouse1Press()
-    mouse1press()
-    task.wait(0.01)
-    mouse1release()
-    return true
-end
-
 local function fireReplay()
     if not ShotDebugRef then return false end
-    local s = ShotDebugRef:GetLastShoot()
-    if not s then return false end
-    -- Replay payload dengan origin/direction dimodifikasi ke arah crosshair sekarang
+    local best = ShotDebugRef:GetBestShootPayload()
+    if not best then return false end
+
+    -- Ambil remote
+    local RE = game:GetService("ReplicatedStorage"):FindFirstChild("Events")
+    local REs = RE and RE:FindFirstChild("RemoteEvents")
+    if not REs then return false end
+    local remote = REs:FindFirstChild(best.name)
+    if not remote then return false end
+
+    -- Clone args
     local newArgs = {}
-    for i, v in ipairs(s.args) do newArgs[i] = v end
+    for i, v in ipairs(best.args) do newArgs[i] = v end
 
-    -- Coba modifikasi Vector3 kedua ke direction kamera (heuristik)
-    local camDir = Camera.CFrame.LookVector
+    -- Update position/direction ke kamera sekarang
     local camPos = Camera.CFrame.Position
+    local camDir = Camera.CFrame.LookVector
 
-    -- Jika arg1 Vector3 & arg2 Vector3 → kemungkinan (origin, direction)
-    if typeof(newArgs[1]) == "Vector3" and typeof(newArgs[2]) == "Vector3" then
-        newArgs[1] = camPos
-        newArgs[2] = camDir
-    elseif type(newArgs[1]) == "table" then
-        local t = newArgs[1]
-        for k, v in pairs(t) do
-            if typeof(v) == "Vector3" then
-                if v.Magnitude > 5 then
-                    t[k] = camPos
-                else
-                    t[k] = camDir
+    for i, v in ipairs(newArgs) do
+        if typeof(v) == "Vector3" then
+            local m = v.Magnitude
+            if m > 0.5 and m < 3 then
+                newArgs[i] = camDir       -- direction
+            elseif m > 5 then
+                newArgs[i] = camPos       -- origin
+            end
+        elseif type(v) == "table" then
+            for k, vv in pairs(v) do
+                if typeof(vv) == "Vector3" then
+                    local m = vv.Magnitude
+                    if m > 0.5 and m < 3 then v[k] = camDir
+                    elseif m > 5 then v[k] = camPos end
                 end
             end
         end
     end
 
-    return ShotDebugRef:ReplayShootModified(newArgs)
+    local ok = pcall(function()
+        remote:FireServer(table.unpack(newArgs))
+    end)
+    if ok then fireCount = fireCount + 1 end
+    return ok
 end
 
-local function fireButton()
-    local btn = detectFireButton()
-    if not btn then return false end
-    -- Simulasi tap
-    local pos = btn.AbsolutePosition + btn.AbsoluteSize / 2
+local function fireVIM()
     local VIM = game:GetService("VirtualInputManager")
-    if VIM then
-        VIM:SendMouseButtonEvent(pos.X, pos.Y, 0, true, 1, game, 0)
-        task.wait(0.02)
-        VIM:SendMouseButtonEvent(pos.X, pos.Y, 0, false, 1, game, 0)
-        return true
-    end
-    return false
+    if not VIM then return false end
+    local vp = Camera.ViewportSize
+    local x, y = vp.X / 2, vp.Y / 2
+    local ok1 = pcall(function() VIM:SendMouseButtonEvent(x, y, 0, true, 1, game, 0) end)
+    task.wait(0.015)
+    local ok2 = pcall(function() VIM:SendMouseButtonEvent(x, y, 0, false, 1, game, 0) end)
+    if ok1 and ok2 then fireCount = fireCount + 1 end
+    return ok1 and ok2
+end
+
+local function fireMouse1Click()
+    if type(mouse1click) ~= "function" then return false end
+    local ok = pcall(mouse1click)
+    if ok then fireCount = fireCount + 1 end
+    return ok
+end
+
+local function fireMouse1Press()
+    if type(mouse1press) ~= "function" then return false end
+    pcall(mouse1press)
+    task.wait(0.015)
+    pcall(mouse1release)
+    fireCount = fireCount + 1
+    return true
 end
 
 local function fire()
     local m = AutoFire.Config.Method
-    local ok, err = false, nil
+    local methodsToTry = {}
 
-    if m == "vim" or (m == "auto" and activeMethod == "VIM") then
-        ok, err = pcall(fireVIM)
-    elseif m == "mouse1" or (m == "auto" and activeMethod == "mouse1click") then
-        ok, err = pcall(fireMouse1Click)
-    elseif m == "replay" or (m == "auto" and activeMethod == "replay") then
-        ok, err = pcall(fireReplay)
-    elseif m == "button" or (m == "auto" and activeMethod == "button") then
-        ok, err = pcall(fireButton)
-    elseif m == "auto" then
-        -- coba semua sampai ada yang berhasil
-        for _, method in ipairs({"VIM","mouse1click","mouse1press","replay","button"}) do
-            local fn = ({VIM=fireVIM, mouse1click=fireMouse1Click,
-                        mouse1press=fireMouse1Press, replay=fireReplay,
-                        button=fireButton})[method]
-            if fn then
-                local o, e = pcall(fn)
-                if o then activeMethod = method; ok = true; break end
+    if m == "auto" then
+        methodsToTry = { "replay", "VIM", "mouse1click", "mouse1press" }
+    elseif m == "replay" then
+        methodsToTry = { "replay" }
+    elseif m == "vim" then
+        methodsToTry = { "VIM" }
+    elseif m == "mouse1" then
+        methodsToTry = { "mouse1click" }
+    else
+        methodsToTry = { "replay" }
+    end
+
+    local dispatch = {
+        replay = fireReplay,
+        VIM = fireVIM,
+        mouse1click = fireMouse1Click,
+        mouse1press = fireMouse1Press,
+    }
+
+    for _, method in ipairs(methodsToTry) do
+        local fn = dispatch[method]
+        if fn then
+            local ok, err = pcall(fn)
+            if ok then
+                if activeMethod ~= method then
+                    activeMethod = method
+                    log("OK", "AutoFire active method = "..method)
+                end
+                return
             end
         end
-        if not ok then err = "all methods failed" end
-    else
-        err = "unknown method: " .. m
     end
-
-    if not ok then
-        log("ERR", "AutoFire fire: " .. tostring(err))
-    end
+    log("ERR", "AutoFire: semua metode gagal")
 end
 
 -- ─── CEK CROSSHAIR ───────────────────────────────────────────
@@ -223,12 +215,9 @@ end
 function AutoFire:Init()
     local methods = detectMethods()
     if #methods == 0 then
-        activeMethod = "NONE"
-        log("ERR", "AutoFire: TIDAK ADA metode. Silent tap + replay manual.")
+        log("ERR", "AutoFire: TIDAK ADA metode. Tembak manual dulu 3x.")
     else
-        activeMethod = methods[1]
-        log("OK", "AutoFire methods: " .. table.concat(methods, ", ")
-            .. " (default: " .. activeMethod .. ")")
+        log("OK", "AutoFire methods: "..table.concat(methods, ", "))
     end
     if not renderConn then
         renderConn = RunService.RenderStepped:Connect(function() pcall(loop) end)
@@ -247,15 +236,15 @@ end
 
 function AutoFire:TestMethods()
     log("TEST", "=== AutoFire Methods ===")
-    log("TEST", "VIM: " .. (detectVIM() and "OK" or "FAIL"))
-    log("TEST", "mouse1click: " .. (type(mouse1click) == "function" and "OK" or "MISSING"))
-    log("TEST", "mouse1press: " .. (type(mouse1press) == "function" and "OK" or "MISSING"))
-    log("TEST", "replay: " .. (ShotDebugRef and ShotDebugRef:GetLastShoot() and "OK" or "NO PAYLOAD"))
-    log("TEST", "button: " .. (detectFireButton() and "OK" or "MISSING"))
-    log("TEST", "active: " .. activeMethod)
+    log("TEST", "replay: "..(ShotDebugRef and ShotDebugRef:GetBestShootPayload() and "OK" or "NO PAYLOAD"))
+    log("TEST", "VIM: "..(detectVIM() and "OK" or "FAIL"))
+    log("TEST", "mouse1click: "..(type(mouse1click) == "function" and "OK" or "MISSING"))
+    log("TEST", "mouse1press: "..(type(mouse1press) == "function" and "OK" or "MISSING"))
+    log("TEST", "active: "..activeMethod.." fires="..fireCount)
 end
 
 function AutoFire:GetActiveMethod() return activeMethod end
+function AutoFire:GetFireCount() return fireCount end
 
 function AutoFire:Destroy()
     if renderConn then renderConn:Disconnect(); renderConn = nil end
