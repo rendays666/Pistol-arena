@@ -1,28 +1,14 @@
 --[[
-    RENRENHUB CENTAURA — LOADER v4
+    RENRENHUB CENTAURA — LOADER v5
     URL: https://raw.githubusercontent.com/rendays666/Pistol-arena/refs/heads/main/main.lua
 
-    Modules yang dibutuhkan (upload ke /modules/):
-      - aimbot.lua
-      - esp.lua
-      - autofire.lua
-      - silentaim.lua
-
-    Fitur loader:
-      - Aimbot: FOV Circle / Full Body 360°, Head/Body, Strong/Medium/Smooth
-      - ESP: Names / HP Bar / Distance / Chams / Tracer
-      - Auto Fire: crosshair-based atau aimbot-lock-based
-      - Silent Aim: hook Shoot remote, redirect direction
-      - Console log dengan Copy (untuk debugging di Android)
-      - Auto-save config ke RenrenHub/config.json
-      - Auto-reload via queue_on_teleport
+    Modules (upload ke /modules/):
+      aimbot.lua  |  esp.lua  |  autofire.lua  |  silentaim.lua  |  shotdebug.lua
 ]]
 
 local SCRIPT_URL  = "https://raw.githubusercontent.com/rendays666/Pistol-arena/refs/heads/main/main.lua"
 local MODULES_URL = "https://raw.githubusercontent.com/rendays666/Pistol-arena/refs/heads/main/modules/"
 
--- ═══════════════════════════════════════════════════════════════
--- SERVICES
 -- ═══════════════════════════════════════════════════════════════
 local Players     = game:GetService("Players")
 local HttpService = game:GetService("HttpService")
@@ -94,8 +80,6 @@ local function sanitize(tbl)
         local tv = type(v)
         if tv == "number" or tv == "string" or tv == "boolean" then
             out[k] = v
-        elseif tv == "userdata" and typeof(v) == "Color3" then
-            -- skip, tidak disimpan
         end
     end
     return out
@@ -180,7 +164,7 @@ local function createConsole()
 
     local copyBtn  = mkBtn("Copy",  -154, Color3.fromRGB(30, 140, 50))
     local clearBtn = mkBtn("Clear", -104, Color3.fromRGB(140, 40, 40))
-    local closeBtn = mkBtn("✕",     -54,  Color3.fromRGB(80, 40, 40))
+    local closeBtn = mkBtn("X",     -54,  Color3.fromRGB(80, 40, 40))
 
     local scroll = Instance.new("ScrollingFrame")
     scroll.Size = UDim2.new(1, -10, 1, -32); scroll.Position = UDim2.new(0, 5, 0, 29)
@@ -208,7 +192,7 @@ local function createConsole()
     copyBtn.Activated:Connect(function()
         local text = "=== RENRENHUB LOG ===\n" .. table.concat(LOG_LINES, "\n")
         local ok = copyToClipboard(text)
-        copyBtn.Text = ok and "✓" or "✗"
+        copyBtn.Text = ok and "OK" or "X"
         task.wait(1); copyBtn.Text = "Copy"
     end)
     clearBtn.Activated:Connect(function()
@@ -248,16 +232,16 @@ createConsole()
 log("INFO", "Console created")
 
 if type(writefile) == "function" then
-    log("OK", "writefile available — config akan disimpan")
+    log("OK", "writefile available")
 else
-    log("WARN", "writefile TIDAK tersedia — config tidak bisa disimpan")
+    log("WARN", "writefile tidak tersedia — config tidak bisa disimpan")
 end
 
 -- ═══════════════════════════════════════════════════════════════
 -- MODULE LOADER
 -- ═══════════════════════════════════════════════════════════════
 local function loadModule(name)
-    log("INFO", "Loading module: " .. name)
+    log("INFO", "Loading: " .. name)
     local ok, result = pcall(function()
         local src = game:HttpGet(MODULES_URL .. name .. ".lua", true)
         if not src or #src < 50 then error("empty source") end
@@ -268,7 +252,7 @@ local function loadModule(name)
         log("ERR", "Module '" .. name .. "' returned " .. type(result))
         return nil
     end
-    log("OK", "Module '" .. name .. "' loaded")
+    log("OK", "Loaded: " .. name)
     return result
 end
 
@@ -300,7 +284,7 @@ end
 local Window = Rayfield:CreateWindow({
     Name = "RENRENHUB CENTAURA",
     LoadingTitle = "Memuat module...",
-    LoadingSubtitle = "Aimbot + ESP + Trigger",
+    LoadingSubtitle = "Aimbot + ESP + Trigger + Debug",
     ConfigurationSaving = { Enabled = false },
     KeySystem = false,
 })
@@ -311,6 +295,7 @@ log("OK", "Window created")
 -- ═══════════════════════════════════════════════════════════════
 local Aimbot    = loadModule("aimbot")
 local ESP       = loadModule("esp")
+local ShotDebug = loadModule("shotdebug")
 local AutoFire  = loadModule("autofire")
 local SilentAim = loadModule("silentaim")
 
@@ -319,11 +304,6 @@ local savedAim     = saved.Aimbot    or {}
 local savedESP     = saved.ESP       or {}
 local savedFire    = saved.AutoFire  or {}
 local savedSilent  = saved.SilentAim or {}
-
-if next(savedAim)    then log("INFO", "Config aimbot dimuat")    end
-if next(savedESP)    then log("INFO", "Config ESP dimuat")       end
-if next(savedFire)   then log("INFO", "Config AutoFire dimuat")  end
-if next(savedSilent) then log("INFO", "Config SilentAim dimuat") end
 
 -- Init Aimbot
 if Aimbot then
@@ -339,28 +319,34 @@ if ESP then
     if ok then log("OK", "ESP:Init()") else logErr("ESP:Init", err) end
 end
 
--- Init AutoFire (dengan logger)
+-- Init ShotDebug — HARUS sebelum AutoFire
+if ShotDebug then
+    pcall(function() ShotDebug:SetLogger(log) end)
+    local ok, err = pcall(function() ShotDebug:Init() end)
+    if ok then log("OK", "ShotDebug:Init()") else logErr("ShotDebug:Init", err) end
+else
+    log("WARN", "ShotDebug TIDAK termuat — AutoFire replay method tidak aktif")
+end
+
+-- Init AutoFire
 if AutoFire then
     pcall(function() AutoFire:SetLogger(log) end)
+    if ShotDebug then
+        pcall(function() AutoFire:SetShotDebug(ShotDebug) end)
+    end
     AutoFire:SetConfig(savedFire)
     local ok, err = pcall(function() AutoFire:Init() end)
     if ok then log("OK", "AutoFire:Init()") else logErr("AutoFire:Init", err) end
 
-    -- Wire callback untuk cek apakah aimbot sedang lock
     pcall(function()
         AutoFire:SetAimbotLock(function()
             if not Aimbot or not Aimbot.Config.Enabled then return false end
-            -- pakai internal Aimbot via function export (fallback: anggap true jika enabled)
-            if Aimbot.IsLocked then
-                local ok2, r = pcall(Aimbot.IsLocked)
-                return ok2 and r or false
-            end
-            return true -- fallback: anggap lock kalau aimbot nyala
+            return true
         end)
     end)
 end
 
--- Init SilentAim (dengan logger)
+-- Init SilentAim
 if SilentAim then
     pcall(function() SilentAim:SetLogger(log) end)
     SilentAim:SetConfig(savedSilent)
@@ -368,7 +354,6 @@ if SilentAim then
     if ok then log("OK", "SilentAim:Init()") else logErr("SilentAim:Init", err) end
 end
 
--- Wire save callback
 _saveCb = function() saveConfig(Aimbot, ESP, AutoFire, SilentAim) end
 
 local function pickOpt(opt)
@@ -407,7 +392,7 @@ if Aimbot then
         end),
     })
     T:CreateSlider({
-        Name = "FOV Radius (Circle mode)",
+        Name = "FOV Radius",
         Range = { 20, 1000 }, Increment = 10, Suffix = "px",
         CurrentValue = savedAim.FOVRadius or 150,
         Flag = "Aim_FOVRadius",
@@ -452,7 +437,7 @@ if Aimbot then
         end),
     })
     T:CreateSlider({
-        Name = "Smoothness (Smooth mode)",
+        Name = "Smoothness",
         Range = { 0.02, 1 }, Increment = 0.01, Suffix = "",
         CurrentValue = savedAim.Smoothness or 0.20,
         Flag = "Aim_Smoothness",
@@ -488,8 +473,6 @@ if Aimbot then
             log("CFG", "WallCheck = " .. tostring(v))
         end),
     })
-else
-    log("ERR", "Aimbot module tidak termuat")
 end
 
 -- ═══════════════════════════════════════════════════════════════
@@ -569,8 +552,6 @@ if ESP then
             ESP:SetConfig({ MaxDistance = v })
         end),
     })
-else
-    log("ERR", "ESP module tidak termuat")
 end
 
 -- ═══════════════════════════════════════════════════════════════
@@ -596,11 +577,23 @@ if AutoFire or SilentAim then
             Flag = "AF_OnlyAim",
             Callback = safeFn("AF_OnlyAim", function(v)
                 AutoFire:SetConfig({ OnlyWhenAimbot = v })
-                log("CFG", "AF OnlyWhenAimbot = " .. tostring(v))
+                log("CFG", "AF OnlyAim = " .. tostring(v))
+            end),
+        })
+        T:CreateDropdown({
+            Name = "Fire Method",
+            Options = { "auto", "vim", "mouse1", "replay", "button" },
+            CurrentOption = { savedFire.Method or "auto" },
+            MultipleOptions = false,
+            Flag = "AF_Method",
+            Callback = safeFn("AF_Method", function(opt)
+                local v = pickOpt(opt)
+                AutoFire:SetConfig({ Method = v })
+                log("CFG", "AF Method = " .. tostring(v))
             end),
         })
         T:CreateSlider({
-            Name = "Fire Delay (s)",
+            Name = "Fire Delay",
             Range = { 0.02, 0.5 }, Increment = 0.01, Suffix = "s",
             CurrentValue = savedFire.FireDelay or 0.08,
             Flag = "AF_Delay",
@@ -609,7 +602,7 @@ if AutoFire or SilentAim then
             end),
         })
         T:CreateSlider({
-            Name = "Check Radius (px)",
+            Name = "Check Radius",
             Range = { 10, 150 }, Increment = 5, Suffix = "px",
             CurrentValue = savedFire.CheckRadius or 45,
             Flag = "AF_Radius",
@@ -623,8 +616,6 @@ if AutoFire or SilentAim then
                 AutoFire:TestMethods()
             end),
         })
-    else
-        log("ERR", "AutoFire module tidak termuat — tab partial")
     end
 
     T:CreateSection("Silent Aim")
@@ -640,9 +631,9 @@ if AutoFire or SilentAim then
             end),
         })
         T:CreateSlider({
-            Name = "Safety Angle (°)",
+            Name = "Safety Angle",
             Range = { 5, 180 }, Increment = 5, Suffix = "°",
-            CurrentValue = savedSilent.SafetyAngle or 90,
+            CurrentValue = savedSilent.SafetyAngle or 180,
             Flag = "SA_Angle",
             Callback = safeFn("SA_Angle", function(v)
                 SilentAim:SetConfig({ SafetyAngle = v })
@@ -658,7 +649,7 @@ if AutoFire or SilentAim then
             end),
         })
         T:CreateToggle({
-            Name = "Log Payload Structure",
+            Name = "Log Payload Shape",
             CurrentValue = savedSilent.LogPayload ~= false,
             Flag = "SA_LogPayload",
             Callback = safeFn("SA_LogPayload", function(v)
@@ -669,8 +660,9 @@ if AutoFire or SilentAim then
             Name = "Print Silent Aim Stats",
             Callback = safeFn("SA_Stats", function()
                 local s = SilentAim:GetStats()
-                log("INFO", string.format("SilentAim Stats — confirmed:%d rejected:%d",
-                    s.confirmed, s.rejected))
+                log("INFO", string.format(
+                    "SilentAim: intercepted=%d redirected=%d failed=%d rejected=%d confirmed=%d",
+                    s.intercepted, s.redirected, s.failed, s.rejected, s.confirmed))
             end),
         })
         T:CreateButton({
@@ -680,20 +672,60 @@ if AutoFire or SilentAim then
                 log("INFO", "SilentAim stats reset")
             end),
         })
-    else
-        log("ERR", "SilentAim module tidak termuat — tab partial")
     end
+end
 
-    T:CreateSection("Info")
+-- ═══════════════════════════════════════════════════════════════
+-- TAB: SHOTDEBUG
+-- ═══════════════════════════════════════════════════════════════
+if ShotDebug then
+    local T = Window:CreateTab("ShotDebug", 4483362458)
+
+    T:CreateSection("Live Debug")
     T:CreateButton({
-        Name = "Read This First",
-        Callback = safeFn("SA_Info", function()
-            log("INFO", "═══════════════════════════════════════")
-            log("INFO", "AUTOFIRE — trigger fire saat crosshair di musuh")
-            log("INFO", "SILENT AIM — redirect peluru, kamera tetap")
-            log("INFO", "Jika log penuh 'HitRejected' → matikan SilentAim")
-            log("INFO", "Safety Angle kecil = lebih aman")
-            log("INFO", "═══════════════════════════════════════")
+        Name = "Toggle Debug GUI",
+        Callback = safeFn("SD_Toggle", function()
+            ShotDebug:ToggleGUI()
+            log("INFO", "ShotDebug GUI toggled")
+        end),
+    })
+    T:CreateButton({
+        Name = "Clear Stats",
+        Callback = safeFn("SD_Clear", function()
+            ShotDebug:ClearStats()
+            log("INFO", "ShotDebug cleared")
+        end),
+    })
+
+    T:CreateSection("Replay")
+    T:CreateButton({
+        Name = "Replay Last Shoot",
+        Callback = safeFn("SD_Replay", function()
+            if ShotDebug:ReplayShoot() then
+                log("OK", "Replay fired")
+            else
+                log("WARN", "Replay: no payload / failed")
+            end
+        end),
+    })
+    T:CreateButton({
+        Name = "Print Last Payload",
+        Callback = safeFn("SD_Print", function()
+            local s = ShotDebug:GetLastShoot()
+            if not s then
+                log("WARN", "ShotDebug: belum ada payload, tembak manual dulu")
+                return
+            end
+            log("INFO", "=== Payload ["..s.name.."] "..#s.args.." args ===")
+            for i, v in ipairs(s.args) do
+                log("INFO", string.format("arg%d = %s (%s)", i, tostring(v):sub(1,60), typeof(v)))
+                if type(v) == "table" then
+                    for k, vv in pairs(v) do
+                        log("INFO", string.format("  .%s = %s (%s)",
+                            tostring(k), tostring(vv):sub(1,40), typeof(vv)))
+                    end
+                end
+            end
         end),
     })
 end
@@ -723,15 +755,15 @@ MiscTab:CreateButton({
     Name = "Save Config Now",
     Callback = safeFn("SaveConfigBtn", function()
         local ok = saveConfig(Aimbot, ESP, AutoFire, SilentAim)
-        log(ok and "OK" or "ERR", ok and "Config tersimpan" or "Config gagal disimpan")
+        log(ok and "OK" or "ERR", ok and "Config saved" or "Config save failed")
     end),
 })
 MiscTab:CreateButton({
-    Name = "Reset Config (default)",
+    Name = "Reset Config",
     Callback = safeFn("ResetConfig", function()
         if type(delfile) == "function" and isfile(CONFIG_FILE) then
             pcall(delfile, CONFIG_FILE)
-            log("OK", "Config dihapus. Re-execute untuk reset penuh.")
+            log("OK", "Config deleted. Re-execute untuk reset penuh.")
         else
             log("WARN", "delfile tidak tersedia")
         end
@@ -744,7 +776,6 @@ MiscTab:CreateButton({
     Callback = safeFn("SelfTest", function()
         log("TEST", "=== SELF TEST ===")
         log("TEST", "Clipboard: " .. (copyToClipboard("test") and "OK" or "FAIL"))
-
         local drawOk = pcall(function()
             local d = Drawing.new("Text"); d:Remove()
             local s = Drawing.new("Square"); s:Remove()
@@ -758,10 +789,13 @@ MiscTab:CreateButton({
         log("TEST", "queue_on_teleport: " .. (type(queue_on_teleport) == "function" and "OK" or "FAIL"))
         log("TEST", "Aimbot: " .. (Aimbot and "OK" or "MISSING"))
         log("TEST", "ESP: " .. (ESP and "OK" or "MISSING"))
+        log("TEST", "ShotDebug: " .. (ShotDebug and "OK" or "MISSING"))
         log("TEST", "AutoFire: " .. (AutoFire and "OK" or "MISSING"))
         log("TEST", "SilentAim: " .. (SilentAim and "OK" or "MISSING"))
-        if AutoFire then
-            pcall(function() AutoFire:TestMethods() end)
+        if AutoFire then pcall(function() AutoFire:TestMethods() end) end
+        if ShotDebug then
+            local s = ShotDebug:GetLastShoot()
+            log("TEST", "Last Shoot: " .. (s and (s.name.." ("..#s.args.." args)") or "belum ada"))
         end
         log("TEST", "=== END ===")
     end),
@@ -790,9 +824,10 @@ MiscTab:CreateButton({
     Callback = safeFn("DestroyAll", function()
         if Aimbot    then pcall(function() Aimbot:Destroy()    end) end
         if ESP       then pcall(function() ESP:Destroy()       end) end
+        if ShotDebug then pcall(function() ShotDebug:Destroy() end) end
         if AutoFire  then pcall(function() AutoFire:Destroy()  end) end
         if SilentAim then pcall(function() SilentAim:Destroy() end) end
-        log("INFO", "Semua module di-destroy")
+        log("INFO", "Semua module destroyed")
     end),
 })
 
@@ -811,7 +846,7 @@ do
         registered = ok
     end
     if registered then
-        log("OK", "Auto-reload on teleport: AKTIF")
+        log("OK", "Auto-reload on teleport: ON")
     else
         log("WARN", "queue_on_teleport TIDAK tersedia")
     end
@@ -823,14 +858,15 @@ end
 log("INFO", "=== LOADER READY ===")
 
 pcall(function()
-    local statuses = {}
-    if Aimbot    then table.insert(statuses, "Aim:OK")  else table.insert(statuses, "Aim:X")  end
-    if ESP       then table.insert(statuses, "ESP:OK")  else table.insert(statuses, "ESP:X")  end
-    if AutoFire  then table.insert(statuses, "Fire:OK") else table.insert(statuses, "Fire:X") end
-    if SilentAim then table.insert(statuses, "SA:OK")   else table.insert(statuses, "SA:X")   end
+    local s = {}
+    if Aimbot    then table.insert(s, "Aim:OK")    else table.insert(s, "Aim:X")    end
+    if ESP       then table.insert(s, "ESP:OK")    else table.insert(s, "ESP:X")    end
+    if ShotDebug then table.insert(s, "Debug:OK")  else table.insert(s, "Debug:X")  end
+    if AutoFire  then table.insert(s, "Fire:OK")   else table.insert(s, "Fire:X")   end
+    if SilentAim then table.insert(s, "SA:OK")     else table.insert(s, "SA:X")     end
     Rayfield:Notify({
         Title = "Loaded",
-        Content = table.concat(statuses, " | "),
+        Content = table.concat(s, " | "),
         Duration = 5,
     })
 end)
