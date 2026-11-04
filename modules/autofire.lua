@@ -1,139 +1,103 @@
 --[[
-    MODULE: AutoFire v4 (MOBILE FOCUSED)
-    Prioritas: Tombol Fire di layar → VIM Center → mouse1click
-    Hook ke GUI button HP langsung, jadi pasti tembak.
+    MODULE: AutoFire v6 (BRUTE FORCE MOBILE)
+    Mencari tombol paling besar di area kanan bawah layar dan melakukan tap.
 ]]
 
 local AutoFire = {}
 AutoFire.Config = {
     Enabled        = false,
     FireDelay      = 0.15,
-    CheckRadius    = 120, -- Diperbesar biar gampang kena target
+    CheckRadius    = 150,
     OnlyWhenAimbot = false,
     TeamCheck      = false,
-    Method         = "auto",
 }
 
 local Players     = game:GetService("Players")
 local RunService  = game:GetService("RunService")
 local Camera      = workspace.CurrentCamera
 local LP          = Players.LocalPlayer
+local PG          = LP:WaitForChild("PlayerGui")
 
 local log = function() end
 local renderConn = nil
 local lastFire = 0
-local activeMethod = "NONE"
-local aimbotLockFn = nil
 local fireCount = 0
 local cachedFireBtn = nil
-local lastBtnScan = 0
+local lastScan = 0
 
--- ─── DETEKSI TOMBOL FIRE ─────────────────────────────────────
+-- ─── SCAN TOMBOL FIRE (BRUTE FORCE) ──────────────────────────
 local function findFireButton()
-    if cachedFireBtn and cachedFireBtn.Parent then return cachedFireBtn end
-    if tick() - lastBtnScan < 3 then return cachedFireBtn end
-    lastBtnScan = tick()
-
-    local PG = LP:FindFirstChild("PlayerGui")
-    if not PG then return nil end
-
-    -- 1. Cari di GUI yang diketahui
-    local guis = {"WeaponGui", "WeaponTouchGui", "TouchGui", "HotbarGui"}
-    for _, gName in ipairs(guis) do
-        local g = PG:FindFirstChild(gName)
-        if g then
-            for _, v in ipairs(g:GetDescendants()) do
-                if v:IsA("ImageButton") or v:IsA("TextButton") then
-                    local n = v.Name:lower()
-                    if n:find("fire") or n:find("shoot") or n:find("attack") or n:find("trigger") then
-                        cachedFireBtn = v
-                        return v
+    if cachedFireBtn and cachedFireBtn.Parent and cachedFireBtn.Visible then
+        return cachedFireBtn
+    end
+    if tick() - lastScan < 2 then return cachedFireBtn end
+    lastScan = tick()
+    
+    local vp = Camera.ViewportSize
+    local bestBtn, maxArea = nil, 0
+    
+    -- Scan semua GUI Button
+    for _, obj in ipairs(PG:GetDescendants()) do
+        if obj:IsA("GuiButton") and obj.Visible then
+            local pos = obj.AbsolutePosition
+            local size = obj.AbsoluteSize
+            
+            -- Cari yang ada di kuadran kanan bawah (X > 50% layar, Y > 40% layar)
+            -- Dan bukan menu seperti Shop/Inventory
+            if pos.X > vp.X * 0.5 and pos.Y > vp.Y * 0.4 then
+                local name = obj.Name:lower()
+                -- Filter nama menu
+                if not name:find("shop") and not name:find("inventory") and not name:find("setting") then
+                    local area = size.X * size.Y
+                    if area > maxArea and area < 20000 then -- Batasi ukuran agar tidak ambil frame raksasa
+                        maxArea = area
+                        bestBtn = obj
                     end
                 end
             end
         end
     end
-
-    -- 2. Cari di semua GUI (Recursive)
-    for _, v in ipairs(PG:GetDescendants()) do
-        if v:IsA("ImageButton") or v:IsA("TextButton") then
-            local n = v.Name:lower()
-            if n:find("fire") or n:find("shoot") or n:find("primary") then
-                cachedFireBtn = v
-                return v
-            end
-        end
+    
+    if bestBtn then
+        log("INFO", "AutoFire: Menemukan tombol ["..bestBtn.Name.."] di X:"..math.floor(bestBtn.AbsolutePosition.X).." Y:"..math.floor(bestBtn.AbsolutePosition.Y))
+        cachedFireBtn = bestBtn
     end
-
-    return nil
+    return bestBtn
 end
 
--- ─── FIRE METHODS ────────────────────────────────────────────
-local function fireMobileButton()
-    local btn = findFireButton()
-    if not btn then return false end
-    
+-- ─── FIRE (TAP LAYAR) ────────────────────────────────────────
+local function fire()
     local VIM = game:GetService("VirtualInputManager")
-    if VIM and btn.AbsoluteSize.Magnitude > 0 then
+    if not VIM then return false end
+
+    local btn = findFireButton()
+    if btn then
         local pos = btn.AbsolutePosition + (btn.AbsoluteSize / 2)
-        pcall(function()
-            -- Simulasi tap layar (Touch) via Mouse Event
+        local ok = pcall(function()
             VIM:SendMouseButtonEvent(pos.X, pos.Y, 0, true, 1, game, 0)
-            task.wait(0.03)
+            task.wait(0.02)
             VIM:SendMouseButtonEvent(pos.X, pos.Y, 0, false, 1, game, 0)
+        end)
+        if ok then
+            fireCount = fireCount + 1
+            if fireCount == 1 then log("OK", "AutoFire berhasil tap tombol.") end
+            return true
+        end
+    else
+        -- Jika tidak ketemu tombol, tap pojok kanan bawah sebagai fallback
+        local vp = Camera.ViewportSize
+        local x, y = vp.X - 80, vp.Y - 80
+        pcall(function()
+            VIM:SendMouseButtonEvent(x, y, 0, true, 1, game, 0)
+            task.wait(0.02)
+            VIM:SendMouseButtonEvent(x, y, 0, false, 1, game, 0)
         end)
         return true
     end
-    
-    -- Fallback kalau VIM gagal
-    pcall(function() btn:Activate() end)
-    return true
+    return false
 end
 
-local function fireVIMCenter()
-    local VIM = game:GetService("VirtualInputManager")
-    if not VIM then return false end
-    local vp = Camera.ViewportSize
-    local x, y = vp.X / 2, vp.Y / 2
-    pcall(function()
-        VIM:SendMouseButtonEvent(x, y, 0, true, 1, game, 0)
-        task.wait(0.03)
-        VIM:SendMouseButtonEvent(x, y, 0, false, 1, game, 0)
-    end)
-    return true
-end
-
-local function fireMouse1Click()
-    if type(mouse1click) ~= "function" then return false end
-    pcall(mouse1click)
-    return true
-end
-
-local function fire()
-    local m = AutoFire.Config.Method
-    local success = false
-
-    if m == "auto" then
-        -- Prioritas tombol layar untuk HP
-        success = fireMobileButton()
-        if not success then success = fireVIMCenter() end
-        if not success then success = fireMouse1Click() end
-    elseif m == "button" then
-        success = fireMobileButton()
-    elseif m == "vim" then
-        success = fireVIMCenter()
-    elseif m == "mouse1" then
-        success = fireMouse1Click()
-    end
-
-    if success then
-        fireCount = fireCount + 1
-    else
-        log("ERR", "AutoFire: gagal nembak (tombol tidak ketemu / VIM error)")
-    end
-end
-
--- ─── CEK CROSSHAIR ───────────────────────────────────────────
+-- ─── CEK TARGET ──────────────────────────────────────────────
 local function isEnemy(plr)
     if plr == LP then return false end
     if AutoFire.Config.TeamCheck and plr.Team and LP.Team and plr.Team == LP.Team then
@@ -149,7 +113,7 @@ local function crosshairOnEnemy()
     for _, plr in ipairs(Players:GetPlayers()) do
         if isEnemy(plr) then
             local c = plr.Character
-            local head = c and c:FindFirstChild("Head")
+            local head = c and (c:FindFirstChild("Head") or c:FindFirstChild("UpperTorso"))
             local hum = c and c:FindFirstChildOfClass("Humanoid")
             if head and hum and hum.Health > 0 then
                 local sp, on = Camera:WorldToViewportPoint(head.Position)
@@ -168,38 +132,24 @@ local function loop()
     if not AutoFire.Config.Enabled then return end
     if tick() - lastFire < AutoFire.Config.FireDelay then return end
 
-    local shouldFire
-    if AutoFire.Config.OnlyWhenAimbot then
-        shouldFire = aimbotLockFn and aimbotLockFn() or false
-    else
-        shouldFire = crosshairOnEnemy()
-    end
-
-    if shouldFire then
-        fire()
-        lastFire = tick()
+    if crosshairOnEnemy() then
+        if fire() then
+            lastFire = tick()
+        end
     end
 end
 
 -- ─── PUBLIC API ──────────────────────────────────────────────
 function AutoFire:Init()
-    local btn = findFireButton()
-    if btn then
-        activeMethod = "button"
-        log("OK", "AutoFire: Tombol Fire ditemukan ("..btn.Name..")")
-    else
-        activeMethod = "vim"
-        log("WARN", "AutoFire: Tombol Fire tidak ketemu, pakai VIM Center")
-    end
-
+    log("INFO", "AutoFire v6 (Brute Force) Started.")
     if not renderConn then
         renderConn = RunService.RenderStepped:Connect(function() pcall(loop) end)
     end
 end
 
 function AutoFire:SetLogger(fn) log = fn end
-function AutoFire:SetAimbotLock(fn) aimbotLockFn = fn end
-function AutoFire:SetShotDebug(_) end -- Tidak dipakai lagi
+function AutoFire:SetAimbotLock(_) end
+function AutoFire:SetShotDebug(_) end
 
 function AutoFire:SetConfig(cfg)
     for k, v in pairs(cfg) do
@@ -208,12 +158,13 @@ function AutoFire:SetConfig(cfg)
 end
 
 function AutoFire:TestMethods()
-    log("TEST", "=== AutoFire Methods ===")
+    log("TEST", "Mencari tombol Fire di layar...")
     local btn = findFireButton()
-    log("TEST", "Button: " .. (btn and btn:GetFullName() or "NOT FOUND"))
-    log("TEST", "VIM Center: OK")
-    log("TEST", "mouse1click: " .. (type(mouse1click) == "function" and "OK" or "MISSING"))
-    log("TEST", "active: " .. activeMethod .. " fires=" .. fireCount)
+    if btn then
+        log("TEST", "Ditemukan: " .. btn:GetFullName())
+    else
+        log("TEST", "Tidak ada tombol ditemukan di area kanan bawah.")
+    end
 end
 
 function AutoFire:Destroy()
