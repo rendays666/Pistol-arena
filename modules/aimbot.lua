@@ -1,36 +1,45 @@
 --[[
     MODULE: Aimbot
-    API:
-      Aimbot:Init()             -- panggil sekali saat startup
-      Aimbot:SetConfig(cfg)     -- update config kapan saja
-      Aimbot:Destroy()          -- cleanup (disconnect loop, remove drawings)
+    API: Init / SetConfig / Destroy
+
+    Modes:
+      FOVMode = "FOV Circle" -> target hanya di dalam circle
+      FOVMode = "Full Body"  -> target di mana saja asal on-screen & <= MaxDistance
+
+    AimPart = "Head" | "Body"
+    Strength = "Strong" | "Medium" | "Smooth"
 ]]
 
 local Aimbot = {}
 
 Aimbot.Config = {
     Enabled     = false,
-    FOVEnabled  = true,
+    TeamCheck   = true,
+    FOVMode     = "FOV Circle",  -- "FOV Circle" | "Full Body"
     FOVRadius   = 150,
-    Smoothness  = 0.20,
-    Strength    = "Smooth",   -- Smooth | Medium | Strong
-    Priority    = "Nearest",  -- Nearest | Lowest HP
-    AimPart     = "Head",     -- Head | Body
     MaxDistance = 250,
+    Strength    = "Smooth",      -- "Strong" | "Medium" | "Smooth"
+    Smoothness  = 0.20,
+    Priority    = "Nearest",     -- "Nearest" | "Lowest HP"
+    AimPart     = "Head",        -- "Head" | "Body"
 }
 
-local Players      = game:GetService("Players")
-local RunService   = game:GetService("RunService")
-local Camera       = workspace.CurrentCamera
-local LocalPlayer  = Players.LocalPlayer
+local Players     = game:GetService("Players")
+local RunService  = game:GetService("RunService")
+local Camera      = workspace.CurrentCamera
+local LocalPlayer = Players.LocalPlayer
 
-local fovCircle = nil
+local fovCircle  = nil
 local renderConn = nil
 
 -- ─── HELPERS ───────────────────────────────────────────────────
 local function isEnemy(plr)
     if plr == LocalPlayer then return false end
-    if plr.Team and LocalPlayer.Team and plr.Team == LocalPlayer.Team then return false end
+    if Aimbot.Config.TeamCheck then
+        if plr.Team and LocalPlayer.Team and plr.Team == LocalPlayer.Team then
+            return false
+        end
+    end
     return true
 end
 
@@ -39,16 +48,21 @@ local function getTargetPart(plr)
     if not c then return nil end
     local hum = c:FindFirstChildOfClass("Humanoid")
     if not hum or hum.Health <= 0 then return nil end
+
     if Aimbot.Config.AimPart == "Head" then
         return c:FindFirstChild("Head")
     end
-    return c:FindFirstChild("HumanoidRootPart")
-        or c:FindFirstChild("UpperTorso")
+
+    -- Body: torso dulu (lebih stabil), fallback ke HRP
+    return c:FindFirstChild("UpperTorso")
         or c:FindFirstChild("Torso")
+        or c:FindFirstChild("HumanoidRootPart")
 end
 
 local function getBestAimEnemy()
     local best, bestDist, bestHP = nil, math.huge, math.huge
+    local center = Vector2.new(Camera.ViewportSize.X / 2, Camera.ViewportSize.Y / 2)
+
     for _, plr in ipairs(Players:GetPlayers()) do
         if isEnemy(plr) then
             local part = getTargetPart(plr)
@@ -57,14 +71,19 @@ local function getBestAimEnemy()
                 local dist = (Camera.CFrame.Position - part.Position).Magnitude
                 if onScreen and dist <= Aimbot.Config.MaxDistance then
                     local allowed = true
-                    if Aimbot.Config.FOVEnabled and fovCircle then
-                        local center = Vector2.new(Camera.ViewportSize.X / 2, Camera.ViewportSize.Y / 2)
-                        allowed = (Vector2.new(screenPos.X, screenPos.Y) - center).Magnitude
-                                  <= Aimbot.Config.FOVRadius
+
+                    -- Cek FOV hanya kalau mode = "FOV Circle"
+                    if Aimbot.Config.FOVMode == "FOV Circle" then
+                        local screen2D = Vector2.new(screenPos.X, screenPos.Y)
+                        allowed = (screen2D - center).Magnitude <= Aimbot.Config.FOVRadius
                     end
+
                     if allowed then
-                        local ray = Ray.new(Camera.CFrame.Position,
-                            (part.Position - Camera.CFrame.Position).Unit * dist)
+                        -- Cek line of sight (tidak ada tembok)
+                        local ray = Ray.new(
+                            Camera.CFrame.Position,
+                            (part.Position - Camera.CFrame.Position).Unit * dist
+                        )
                         local hit = workspace:FindPartOnRay(ray, LocalPlayer.Character, false, true)
                         if hit and hit:IsDescendantOf(plr.Character) then
                             if Aimbot.Config.Priority == "Nearest" then
@@ -101,7 +120,6 @@ end
 
 -- ─── PUBLIC API ────────────────────────────────────────────────
 function Aimbot:Init()
-    -- FOV Circle
     if not fovCircle then
         pcall(function()
             fovCircle = Drawing.new("Circle")
@@ -114,7 +132,6 @@ function Aimbot:Init()
         end)
     end
 
-    -- Render loop
     if not renderConn then
         renderConn = RunService.RenderStepped:Connect(function()
             if fovCircle then
@@ -124,7 +141,8 @@ function Aimbot:Init()
                         Camera.ViewportSize.Y / 2
                     )
                     fovCircle.Radius  = self.Config.FOVRadius
-                    fovCircle.Visible = self.Config.Enabled and self.Config.FOVEnabled
+                    fovCircle.Visible = self.Config.Enabled
+                        and self.Config.FOVMode == "FOV Circle"
                 end)
             end
 
@@ -141,21 +159,13 @@ end
 
 function Aimbot:SetConfig(cfg)
     for k, v in pairs(cfg) do
-        if self.Config[k] ~= nil then
-            self.Config[k] = v
-        end
+        if self.Config[k] ~= nil then self.Config[k] = v end
     end
 end
 
 function Aimbot:Destroy()
-    if renderConn then
-        renderConn:Disconnect()
-        renderConn = nil
-    end
-    if fovCircle then
-        pcall(function() fovCircle:Remove() end)
-        fovCircle = nil
-    end
+    if renderConn then renderConn:Disconnect(); renderConn = nil end
+    if fovCircle then pcall(function() fovCircle:Remove() end); fovCircle = nil end
 end
 
 return Aimbot
