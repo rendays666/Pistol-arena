@@ -15,7 +15,7 @@
 -- ═══════════════════════════════════════════════════════════════
 -- EDIT URL INI sesuai repo GitHub kamu
 -- ═══════════════════════════════════════════════════════════════
-local MODULES_URL = "https://raw.githubusercontent.com/USERNAME/REPO/main/modules/"
+local MODULES_URL = "https://raw.githubusercontent.com/rendays666/Pistol-arena/refs/heads/main/main.lua"
 -- ═══════════════════════════════════════════════════════════════
 
 local Rayfield = loadstring(game:HttpGet("https://sirius.menu/rayfield"))()
