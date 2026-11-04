@@ -1,15 +1,13 @@
 --[[
     MODULE: ESP
-    API:
-      ESP:Init()
-      ESP:SetConfig(cfg)
-      ESP:Destroy()
+    API: Init / SetConfig / Destroy
 ]]
 
 local ESP = {}
 
 ESP.Config = {
     Enabled      = false,
+    TeamCheck    = true,
     ShowNames    = true,
     ShowHP       = true,
     ShowDistance = true,
@@ -27,7 +25,11 @@ local renderConn = nil
 -- ─── HELPERS ───────────────────────────────────────────────────
 local function isEnemy(plr)
     if plr == LocalPlayer then return false end
-    if plr.Team and LocalPlayer.Team and plr.Team == LocalPlayer.Team then return false end
+    if ESP.Config.TeamCheck then
+        if plr.Team and LocalPlayer.Team and plr.Team == LocalPlayer.Team then
+            return false
+        end
+    end
     return true
 end
 
@@ -39,7 +41,7 @@ local function clearAll()
 end
 
 local function createESP(plr)
-    local okD, n, h, d = pcall(function()
+    local ok, n, h, d = pcall(function()
         local a = Drawing.new("Text")
         a.Size = 16; a.Color = Color3.fromRGB(255, 255, 0); a.Center = true; a.Outline = true
         local b = Drawing.new("Text")
@@ -48,14 +50,14 @@ local function createESP(plr)
         c.Size = 14; c.Color = Color3.fromRGB(0, 180, 255); c.Center = true; c.Outline = true
         return a, b, c
     end)
-    if okD then
+    if ok then
         espObjects[plr] = { name = n, hp = h, dist = d }
     end
 end
 
 local function updateLoop()
     if not ESP.Config.Enabled then
-        clearAll()
+        if next(espObjects) then clearAll() end
         return
     end
 
@@ -110,7 +112,6 @@ local function updateLoop()
     end
 end
 
--- Auto-cleanup kalau player leave
 Players.PlayerRemoving:Connect(function(plr)
     if espObjects[plr] then
         for _, d in pairs(espObjects[plr]) do pcall(function() d:Remove() end) end
@@ -129,17 +130,12 @@ end
 
 function ESP:SetConfig(cfg)
     for k, v in pairs(cfg) do
-        if self.Config[k] ~= nil then
-            self.Config[k] = v
-        end
+        if self.Config[k] ~= nil then self.Config[k] = v end
     end
 end
 
 function ESP:Destroy()
-    if renderConn then
-        renderConn:Disconnect()
-        renderConn = nil
-    end
+    if renderConn then renderConn:Disconnect(); renderConn = nil end
     clearAll()
 end
 
