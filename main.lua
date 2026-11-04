@@ -1,17 +1,28 @@
 --[[
-    RENRENHUB CENTAURA — LOADER v3
-    - Aimbot: FOV Circle / Full Body 360° (tembus belakang kamera)
-    - ESP: HP Bar berwarna (hijau→merah)
-    - Auto-save config ke RenrenHub/config.json
-    - Auto-reload via queue_on_teleport (tidak perlu re-execute setiap match)
-    - Console log dengan Copy
+    RENRENHUB CENTAURA — LOADER v4
+    URL: https://raw.githubusercontent.com/rendays666/Pistol-arena/refs/heads/main/main.lua
+
+    Modules yang dibutuhkan (upload ke /modules/):
+      - aimbot.lua
+      - esp.lua
+      - autofire.lua
+      - silentaim.lua
+
+    Fitur loader:
+      - Aimbot: FOV Circle / Full Body 360°, Head/Body, Strong/Medium/Smooth
+      - ESP: Names / HP Bar / Distance / Chams / Tracer
+      - Auto Fire: crosshair-based atau aimbot-lock-based
+      - Silent Aim: hook Shoot remote, redirect direction
+      - Console log dengan Copy (untuk debugging di Android)
+      - Auto-save config ke RenrenHub/config.json
+      - Auto-reload via queue_on_teleport
 ]]
 
-local SCRIPT_URL = "https://raw.githubusercontent.com/rendays666/Pistol-arena/refs/heads/main/main.lua"
+local SCRIPT_URL  = "https://raw.githubusercontent.com/rendays666/Pistol-arena/refs/heads/main/main.lua"
 local MODULES_URL = "https://raw.githubusercontent.com/rendays666/Pistol-arena/refs/heads/main/modules/"
 
 -- ═══════════════════════════════════════════════════════════════
--- SERVICES & UTIL
+-- SERVICES
 -- ═══════════════════════════════════════════════════════════════
 local Players     = game:GetService("Players")
 local HttpService = game:GetService("HttpService")
@@ -19,7 +30,6 @@ local UIS         = game:GetService("UserInputService")
 local LP          = Players.LocalPlayer
 local PG          = LP:WaitForChild("PlayerGui")
 
--- cleanup previous console
 do
     local old = PG:FindFirstChild("RH_Console")
     if old then old:Destroy() end
@@ -30,7 +40,7 @@ end
 -- ═══════════════════════════════════════════════════════════════
 local LOG_LINES, MAX_LOG = {}, 800
 local consoleUI = nil
-local hasError = false
+local hasError  = false
 
 local function fmtTime()
     local t = tick()
@@ -62,7 +72,7 @@ local function copyToClipboard(text)
 end
 
 -- ═══════════════════════════════════════════════════════════════
--- CONFIG PERSISTENCE (file-based, auto save)
+-- CONFIG PERSISTENCE
 -- ═══════════════════════════════════════════════════════════════
 local CONFIG_FOLDER = "RenrenHub"
 local CONFIG_FILE   = CONFIG_FOLDER .. "/config.json"
@@ -82,17 +92,23 @@ local function sanitize(tbl)
     if type(tbl) ~= "table" then return out end
     for k, v in pairs(tbl) do
         local tv = type(v)
-        if tv == "number" or tv == "string" or tv == "boolean" then out[k] = v end
+        if tv == "number" or tv == "string" or tv == "boolean" then
+            out[k] = v
+        elseif tv == "userdata" and typeof(v) == "Color3" then
+            -- skip, tidak disimpan
+        end
     end
     return out
 end
 
-local function saveConfig(Aimbot, ESP)
+local function saveConfig(Aimbot, ESP, AutoFire, SilentAim)
     if type(writefile) ~= "function" then return false end
     ensureFolder()
     local data = {
-        Aimbot = sanitize(Aimbot and Aimbot.Config or {}),
-        ESP    = sanitize(ESP and ESP.Config or {}),
+        Aimbot    = sanitize(Aimbot and Aimbot.Config or {}),
+        ESP       = sanitize(ESP and ESP.Config or {}),
+        AutoFire  = sanitize(AutoFire and AutoFire.Config or {}),
+        SilentAim = sanitize(SilentAim and SilentAim.Config or {}),
     }
     local ok, err = pcall(function()
         writefile(CONFIG_FILE, HttpService:JSONEncode(data))
@@ -111,9 +127,7 @@ local function loadSavedConfig()
     return data
 end
 
--- Debounced save
-local _lastSave = 0
-local _saveCb = nil
+local _lastSave, _saveCb = 0, nil
 local function scheduleSave()
     local now = tick()
     if now - _lastSave < 0.3 then return end
@@ -202,7 +216,6 @@ local function createConsole()
     end)
     closeBtn.Activated:Connect(function() frame.Visible = false end)
 
-    -- Drag
     local drag, ds, sp = false, nil, nil
     titleBar.InputBegan:Connect(function(i)
         if i.UserInputType == Enum.UserInputType.Touch or i.UserInputType == Enum.UserInputType.MouseButton1 then
@@ -287,38 +300,76 @@ end
 local Window = Rayfield:CreateWindow({
     Name = "RENRENHUB CENTAURA",
     LoadingTitle = "Memuat module...",
-    LoadingSubtitle = "Aimbot + ESP",
-    ConfigurationSaving = { Enabled = false }, -- pakai config sendiri
+    LoadingSubtitle = "Aimbot + ESP + Trigger",
+    ConfigurationSaving = { Enabled = false },
     KeySystem = false,
 })
 log("OK", "Window created")
 
 -- ═══════════════════════════════════════════════════════════════
--- LOAD MODULES + APPLY SAVED CONFIG
+-- LOAD MODULES
 -- ═══════════════════════════════════════════════════════════════
-local Aimbot = loadModule("aimbot")
-local ESP    = loadModule("esp")
+local Aimbot    = loadModule("aimbot")
+local ESP       = loadModule("esp")
+local AutoFire  = loadModule("autofire")
+local SilentAim = loadModule("silentaim")
 
-local saved = loadSavedConfig() or {}
-local savedAim = saved.Aimbot or {}
-local savedESP = saved.ESP or {}
+local saved        = loadSavedConfig() or {}
+local savedAim     = saved.Aimbot    or {}
+local savedESP     = saved.ESP       or {}
+local savedFire    = saved.AutoFire  or {}
+local savedSilent  = saved.SilentAim or {}
 
-if next(savedAim) then log("INFO", "Config aimbot dimuat dari file") end
-if next(savedESP) then log("INFO", "Config ESP dimuat dari file") end
+if next(savedAim)    then log("INFO", "Config aimbot dimuat")    end
+if next(savedESP)    then log("INFO", "Config ESP dimuat")       end
+if next(savedFire)   then log("INFO", "Config AutoFire dimuat")  end
+if next(savedSilent) then log("INFO", "Config SilentAim dimuat") end
 
+-- Init Aimbot
 if Aimbot then
-    Aimbot:SetConfig(savedAim)  -- apply config dulu
+    Aimbot:SetConfig(savedAim)
     local ok, err = pcall(function() Aimbot:Init() end)
     if ok then log("OK", "Aimbot:Init()") else logErr("Aimbot:Init", err) end
 end
+
+-- Init ESP
 if ESP then
     ESP:SetConfig(savedESP)
     local ok, err = pcall(function() ESP:Init() end)
     if ok then log("OK", "ESP:Init()") else logErr("ESP:Init", err) end
 end
 
+-- Init AutoFire (dengan logger)
+if AutoFire then
+    pcall(function() AutoFire:SetLogger(log) end)
+    AutoFire:SetConfig(savedFire)
+    local ok, err = pcall(function() AutoFire:Init() end)
+    if ok then log("OK", "AutoFire:Init()") else logErr("AutoFire:Init", err) end
+
+    -- Wire callback untuk cek apakah aimbot sedang lock
+    pcall(function()
+        AutoFire:SetAimbotLock(function()
+            if not Aimbot or not Aimbot.Config.Enabled then return false end
+            -- pakai internal Aimbot via function export (fallback: anggap true jika enabled)
+            if Aimbot.IsLocked then
+                local ok2, r = pcall(Aimbot.IsLocked)
+                return ok2 and r or false
+            end
+            return true -- fallback: anggap lock kalau aimbot nyala
+        end)
+    end)
+end
+
+-- Init SilentAim (dengan logger)
+if SilentAim then
+    pcall(function() SilentAim:SetLogger(log) end)
+    SilentAim:SetConfig(savedSilent)
+    local ok, err = pcall(function() SilentAim:Init() end)
+    if ok then log("OK", "SilentAim:Init()") else logErr("SilentAim:Init", err) end
+end
+
 -- Wire save callback
-_saveCb = function() saveConfig(Aimbot, ESP) end
+_saveCb = function() saveConfig(Aimbot, ESP, AutoFire, SilentAim) end
 
 local function pickOpt(opt)
     if type(opt) == "table" then return opt[1] end
@@ -338,7 +389,7 @@ if Aimbot then
         Flag = "Aim_Enabled",
         Callback = safeFn("Aim_Enabled", function(v)
             Aimbot:SetConfig({ Enabled = v })
-            log("CFG", "Aimbot Enabled = " .. tostring(v))
+            log("CFG", "Aimbot = " .. tostring(v))
         end),
     })
 
@@ -357,9 +408,7 @@ if Aimbot then
     })
     T:CreateSlider({
         Name = "FOV Radius (Circle mode)",
-        Range = { 20, 1000 },
-        Increment = 10,
-        Suffix = "px",
+        Range = { 20, 1000 }, Increment = 10, Suffix = "px",
         CurrentValue = savedAim.FOVRadius or 150,
         Flag = "Aim_FOVRadius",
         Callback = safeFn("Aim_FOVRadius", function(v)
@@ -404,9 +453,7 @@ if Aimbot then
     })
     T:CreateSlider({
         Name = "Smoothness (Smooth mode)",
-        Range = { 0.02, 1 },
-        Increment = 0.01,
-        Suffix = "",
+        Range = { 0.02, 1 }, Increment = 0.01, Suffix = "",
         CurrentValue = savedAim.Smoothness or 0.20,
         Flag = "Aim_Smoothness",
         Callback = safeFn("Aim_Smoothness", function(v)
@@ -415,9 +462,7 @@ if Aimbot then
     })
     T:CreateSlider({
         Name = "Max Distance",
-        Range = { 50, 5000 },
-        Increment = 50,
-        Suffix = "m",
+        Range = { 50, 5000 }, Increment = 50, Suffix = "m",
         CurrentValue = savedAim.MaxDistance or 250,
         Flag = "Aim_MaxDist",
         Callback = safeFn("Aim_MaxDist", function(v)
@@ -428,10 +473,19 @@ if Aimbot then
     T:CreateSection("Misc")
     T:CreateToggle({
         Name = "Team Check",
-        CurrentValue = savedAim.TeamCheck ~= false,
+        CurrentValue = savedAim.TeamCheck == true,
         Flag = "Aim_TeamCheck",
         Callback = safeFn("Aim_TeamCheck", function(v)
             Aimbot:SetConfig({ TeamCheck = v })
+        end),
+    })
+    T:CreateToggle({
+        Name = "Wall Check (LOS)",
+        CurrentValue = savedAim.WallCheck ~= false,
+        Flag = "Aim_WallCheck",
+        Callback = safeFn("Aim_WallCheck", function(v)
+            Aimbot:SetConfig({ WallCheck = v })
+            log("CFG", "WallCheck = " .. tostring(v))
         end),
     })
 else
@@ -451,7 +505,7 @@ if ESP then
         Flag = "ESP_Enabled",
         Callback = safeFn("ESP_Enabled", function(v)
             ESP:SetConfig({ Enabled = v })
-            log("CFG", "ESP Enabled = " .. tostring(v))
+            log("CFG", "ESP = " .. tostring(v))
         end),
     })
     T:CreateToggle({
@@ -479,8 +533,26 @@ if ESP then
         end),
     })
     T:CreateToggle({
+        Name = "Show Chams",
+        CurrentValue = savedESP.ShowChams == true,
+        Flag = "ESP_Chams",
+        Callback = safeFn("ESP_Chams", function(v)
+            ESP:SetConfig({ ShowChams = v })
+            log("CFG", "Chams = " .. tostring(v))
+        end),
+    })
+    T:CreateToggle({
+        Name = "Show Tracer",
+        CurrentValue = savedESP.ShowTracer == true,
+        Flag = "ESP_Tracer",
+        Callback = safeFn("ESP_Tracer", function(v)
+            ESP:SetConfig({ ShowTracer = v })
+            log("CFG", "Tracer = " .. tostring(v))
+        end),
+    })
+    T:CreateToggle({
         Name = "Team Check",
-        CurrentValue = savedESP.TeamCheck ~= false,
+        CurrentValue = savedESP.TeamCheck == true,
         Flag = "ESP_TeamCheck",
         Callback = safeFn("ESP_TeamCheck", function(v)
             ESP:SetConfig({ TeamCheck = v })
@@ -490,9 +562,7 @@ if ESP then
     T:CreateSection("Values")
     T:CreateSlider({
         Name = "Max Distance",
-        Range = { 50, 5000 },
-        Increment = 50,
-        Suffix = "m",
+        Range = { 50, 5000 }, Increment = 50, Suffix = "m",
         CurrentValue = savedESP.MaxDistance or 250,
         Flag = "ESP_MaxDist",
         Callback = safeFn("ESP_MaxDist", function(v)
@@ -501,6 +571,131 @@ if ESP then
     })
 else
     log("ERR", "ESP module tidak termuat")
+end
+
+-- ═══════════════════════════════════════════════════════════════
+-- TAB: TRIGGER (AutoFire + SilentAim)
+-- ═══════════════════════════════════════════════════════════════
+if AutoFire or SilentAim then
+    local T = Window:CreateTab("Trigger", 4483362458)
+
+    T:CreateSection("Auto Fire")
+    if AutoFire then
+        T:CreateToggle({
+            Name = "Enable Auto Fire",
+            CurrentValue = savedFire.Enabled == true,
+            Flag = "AF_Enabled",
+            Callback = safeFn("AF_Enabled", function(v)
+                AutoFire:SetConfig({ Enabled = v })
+                log("CFG", "AutoFire = " .. tostring(v))
+            end),
+        })
+        T:CreateToggle({
+            Name = "Only When Aimbot Locked",
+            CurrentValue = savedFire.OnlyWhenAimbot == true,
+            Flag = "AF_OnlyAim",
+            Callback = safeFn("AF_OnlyAim", function(v)
+                AutoFire:SetConfig({ OnlyWhenAimbot = v })
+                log("CFG", "AF OnlyWhenAimbot = " .. tostring(v))
+            end),
+        })
+        T:CreateSlider({
+            Name = "Fire Delay (s)",
+            Range = { 0.02, 0.5 }, Increment = 0.01, Suffix = "s",
+            CurrentValue = savedFire.FireDelay or 0.08,
+            Flag = "AF_Delay",
+            Callback = safeFn("AF_Delay", function(v)
+                AutoFire:SetConfig({ FireDelay = v })
+            end),
+        })
+        T:CreateSlider({
+            Name = "Check Radius (px)",
+            Range = { 10, 150 }, Increment = 5, Suffix = "px",
+            CurrentValue = savedFire.CheckRadius or 45,
+            Flag = "AF_Radius",
+            Callback = safeFn("AF_Radius", function(v)
+                AutoFire:SetConfig({ CheckRadius = v })
+            end),
+        })
+        T:CreateButton({
+            Name = "Test Fire Methods",
+            Callback = safeFn("AF_Test", function()
+                AutoFire:TestMethods()
+            end),
+        })
+    else
+        log("ERR", "AutoFire module tidak termuat — tab partial")
+    end
+
+    T:CreateSection("Silent Aim")
+    if SilentAim then
+        T:CreateToggle({
+            Name = "Enable Silent Aim",
+            CurrentValue = savedSilent.Enabled == true,
+            Flag = "SA_Enabled",
+            Callback = safeFn("SA_Enabled", function(v)
+                SilentAim:SetConfig({ Enabled = v })
+                SilentAim:ResetStats()
+                log("CFG", "SilentAim = " .. tostring(v))
+            end),
+        })
+        T:CreateSlider({
+            Name = "Safety Angle (°)",
+            Range = { 5, 180 }, Increment = 5, Suffix = "°",
+            CurrentValue = savedSilent.SafetyAngle or 90,
+            Flag = "SA_Angle",
+            Callback = safeFn("SA_Angle", function(v)
+                SilentAim:SetConfig({ SafetyAngle = v })
+            end),
+        })
+        T:CreateSlider({
+            Name = "Max Distance",
+            Range = { 50, 1000 }, Increment = 50, Suffix = "m",
+            CurrentValue = savedSilent.MaxDistance or 500,
+            Flag = "SA_MaxDist",
+            Callback = safeFn("SA_MaxDist", function(v)
+                SilentAim:SetConfig({ MaxDistance = v })
+            end),
+        })
+        T:CreateToggle({
+            Name = "Log Payload Structure",
+            CurrentValue = savedSilent.LogPayload ~= false,
+            Flag = "SA_LogPayload",
+            Callback = safeFn("SA_LogPayload", function(v)
+                SilentAim:SetConfig({ LogPayload = v })
+            end),
+        })
+        T:CreateButton({
+            Name = "Print Silent Aim Stats",
+            Callback = safeFn("SA_Stats", function()
+                local s = SilentAim:GetStats()
+                log("INFO", string.format("SilentAim Stats — confirmed:%d rejected:%d",
+                    s.confirmed, s.rejected))
+            end),
+        })
+        T:CreateButton({
+            Name = "Reset Stats",
+            Callback = safeFn("SA_Reset", function()
+                SilentAim:ResetStats()
+                log("INFO", "SilentAim stats reset")
+            end),
+        })
+    else
+        log("ERR", "SilentAim module tidak termuat — tab partial")
+    end
+
+    T:CreateSection("Info")
+    T:CreateButton({
+        Name = "Read This First",
+        Callback = safeFn("SA_Info", function()
+            log("INFO", "═══════════════════════════════════════")
+            log("INFO", "AUTOFIRE — trigger fire saat crosshair di musuh")
+            log("INFO", "SILENT AIM — redirect peluru, kamera tetap")
+            log("INFO", "Jika log penuh 'HitRejected' → matikan SilentAim")
+            log("INFO", "Safety Angle kecil = lebih aman")
+            log("INFO", "═══════════════════════════════════════")
+        end),
+    })
 end
 
 -- ═══════════════════════════════════════════════════════════════
@@ -527,7 +722,7 @@ MiscTab:CreateSection("Config")
 MiscTab:CreateButton({
     Name = "Save Config Now",
     Callback = safeFn("SaveConfigBtn", function()
-        local ok = saveConfig(Aimbot, ESP)
+        local ok = saveConfig(Aimbot, ESP, AutoFire, SilentAim)
         log(ok and "OK" or "ERR", ok and "Config tersimpan" or "Config gagal disimpan")
     end),
 })
@@ -549,15 +744,25 @@ MiscTab:CreateButton({
     Callback = safeFn("SelfTest", function()
         log("TEST", "=== SELF TEST ===")
         log("TEST", "Clipboard: " .. (copyToClipboard("test") and "OK" or "FAIL"))
+
         local drawOk = pcall(function()
             local d = Drawing.new("Text"); d:Remove()
             local s = Drawing.new("Square"); s:Remove()
+            local l = Drawing.new("Line"); l:Remove()
+            local c = Drawing.new("Circle"); c:Remove()
         end)
         log("TEST", "Drawing: " .. (drawOk and "OK" or "FAIL"))
+        log("TEST", "hookmetamethod: " .. (type(hookmetamethod) == "function" and "OK" or "MISSING"))
+        log("TEST", "getnamecallmethod: " .. (type(getnamecallmethod) == "function" and "OK" or "MISSING"))
         log("TEST", "writefile: " .. (type(writefile) == "function" and "OK" or "FAIL"))
         log("TEST", "queue_on_teleport: " .. (type(queue_on_teleport) == "function" and "OK" or "FAIL"))
         log("TEST", "Aimbot: " .. (Aimbot and "OK" or "MISSING"))
         log("TEST", "ESP: " .. (ESP and "OK" or "MISSING"))
+        log("TEST", "AutoFire: " .. (AutoFire and "OK" or "MISSING"))
+        log("TEST", "SilentAim: " .. (SilentAim and "OK" or "MISSING"))
+        if AutoFire then
+            pcall(function() AutoFire:TestMethods() end)
+        end
         log("TEST", "=== END ===")
     end),
 })
@@ -574,20 +779,25 @@ MiscTab:CreateButton({
                 log("CFG", "  " .. k .. " = " .. tostring(mod.Config[k]))
             end
         end
-        dump("Aimbot", Aimbot); dump("ESP", ESP)
+        dump("Aimbot", Aimbot)
+        dump("ESP", ESP)
+        dump("AutoFire", AutoFire)
+        dump("SilentAim", SilentAim)
     end),
 })
 MiscTab:CreateButton({
     Name = "Destroy All Modules",
     Callback = safeFn("DestroyAll", function()
-        if Aimbot then pcall(function() Aimbot:Destroy() end) end
-        if ESP then pcall(function() ESP:Destroy() end) end
+        if Aimbot    then pcall(function() Aimbot:Destroy()    end) end
+        if ESP       then pcall(function() ESP:Destroy()       end) end
+        if AutoFire  then pcall(function() AutoFire:Destroy()  end) end
+        if SilentAim then pcall(function() SilentAim:Destroy() end) end
         log("INFO", "Semua module di-destroy")
     end),
 })
 
 -- ═══════════════════════════════════════════════════════════════
--- AUTO-RELOAD via queue_on_teleport
+-- AUTO-RELOAD
 -- ═══════════════════════════════════════════════════════════════
 do
     local registered = false
@@ -603,7 +813,7 @@ do
     if registered then
         log("OK", "Auto-reload on teleport: AKTIF")
     else
-        log("WARN", "queue_on_teleport TIDAK tersedia — perlu re-execute manual setelah pindah server")
+        log("WARN", "queue_on_teleport TIDAK tersedia")
     end
 end
 
@@ -613,10 +823,14 @@ end
 log("INFO", "=== LOADER READY ===")
 
 pcall(function()
+    local statuses = {}
+    if Aimbot    then table.insert(statuses, "Aim:OK")  else table.insert(statuses, "Aim:X")  end
+    if ESP       then table.insert(statuses, "ESP:OK")  else table.insert(statuses, "ESP:X")  end
+    if AutoFire  then table.insert(statuses, "Fire:OK") else table.insert(statuses, "Fire:X") end
+    if SilentAim then table.insert(statuses, "SA:OK")   else table.insert(statuses, "SA:X")   end
     Rayfield:Notify({
         Title = "Loaded",
-        Content = string.format("Aimbot: %s | ESP: %s",
-            Aimbot and "OK" or "FAIL", ESP and "OK" or "FAIL"),
+        Content = table.concat(statuses, " | "),
         Duration = 5,
     })
 end)
