@@ -1,9 +1,7 @@
 --[[
-    MODULE: ShotDebug v2
-    - Capture SEMUA FireServer/InvokeServer
-    - Log detail + payload (rate-limited)
-    - Expose GetLastCapture(name) dan GetBestShootPayload()
-    - GUI live
+    MODULE: ShotDebug v3
+    - Fix OnMap: cek Character jika Player nil
+    - Tampilkan Tombol Fire yang terdeteksi
 ]]
 
 local ShotDebug = {}
@@ -17,83 +15,65 @@ local LP          = Players.LocalPlayer
 local PG          = LP:WaitForChild("PlayerGui")
 
 local log = function() end
-local lastCaptures    = {}      -- [name] = {args, time}
-local remoteCallCount = {}      -- [name] = count
-local recentCalls     = {}      -- {name, args, time} max 30
+local lastCaptures    = {}
+local remoteCallCount = {}
+local recentCalls     = {}
 local hookedNamecall  = false
 local oldNamecall
 local gui, mainFrame, textLabel
 local dragging, dragStart, startPos = false, nil, nil
 
--- Rate limit logging
-local logBudget, logBudgetReset = 15, 0
-local function canLog()
-    local now = tick()
-    if now - logBudgetReset > 1 then
-        logBudgetReset = now
-        logBudget = 15
-    end
-    if logBudget > 0 then logBudget = logBudget - 1; return true end
-    return false
-end
-
--- Remote yang dianggap "shoot-like"
 local function isShootLike(name)
     local n = name:lower()
     return n:find("shoot") or n:find("bullet") or n:find("fire")
         or n:find("attack") or n:find("hit") or n:find("damage")
-        or n:find("muzzle")
 end
 
--- ─── DECODE PAYLOAD ─────────────────────────────────────────
+local function findFireButton()
+    local PGui = LP:FindFirstChild("PlayerGui")
+    if not PGui then return nil end
+    for _, v in ipairs(PGui:GetDescendants()) do
+        if v:IsA("ImageButton") or v:IsA("TextButton") then
+            local n = v.Name:lower()
+            if n:find("fire") or n:find("shoot") or n:find("attack") or n:find("primary") then
+                return v
+            end
+        end
+    end
+    return nil
+end
+
 local function describeArgs(args)
     local parts = {}
     for i = 1, math.min(#args, 6) do
         local v = args[i]
         local t = typeof(v)
         if t == "Vector3" then
-            parts[#parts+1] = string.format("a%d=V3(%.2f,%.2f,%.2f|m=%.2f)",
-                i, v.X, v.Y, v.Z, v.Magnitude)
+            parts[#parts+1] = string.format("a%d=V3(m%.1f)", i, v.Magnitude)
         elseif t == "CFrame" then
             parts[#parts+1] = "a"..i.."=CFrame"
         elseif t == "table" then
-            local ks = {}
-            for k, vv in pairs(v) do
-                if typeof(vv) == "Vector3" then
-                    ks[#ks+1] = tostring(k).."=V3(m=.."..
-                        string.format("%.2f", vv.Magnitude)..")"
-                else
-                    ks[#ks+1] = tostring(k).."="..typeof(vv)
-                end
-            end
-            parts[#parts+1] = "a"..i.."={"..table.concat(ks, ",").."}"
-        elseif t == "Instance" then
-            parts[#parts+1] = "a"..i.."=Inst("..(v.Name or "?")..")"
+            parts[#parts+1] = "a"..i.."=tbl"
         else
             local s = tostring(v)
-            if #s > 20 then s = s:sub(1, 20).."..." end
+            if #s > 15 then s = s:sub(1, 15).."..." end
             parts[#parts+1] = "a"..i.."="..t..":"..s
         end
     end
     return table.concat(parts, "  ")
 end
 
--- ─── CAPTURE ─────────────────────────────────────────────────
 local function capture(name, args)
     remoteCallCount[name] = (remoteCallCount[name] or 0) + 1
     lastCaptures[name] = { args = args, time = tick() }
     table.insert(recentCalls, { name = name, args = args, time = tick() })
     if #recentCalls > 30 then table.remove(recentCalls, 1) end
 
-    -- Log shoot-like selalu (biar bisa debug), non-shoot rate-limited
-    local shouldLog = isShootLike(name) or canLog()
-    if shouldLog then
-        log("CAP", string.format("[%s] n=%d | %s",
-            name, #args, describeArgs(args)))
+    if isShootLike(name) then
+        log("CAP", string.format("[%s] n=%d | %s", name, #args, describeArgs(args)))
     end
 end
 
--- ─── GUI ─────────────────────────────────────────────────────
 local function buildGUI()
     gui = Instance.new("ScreenGui")
     gui.Name = "RH_ShotDebug"; gui.ResetOnSpawn = false
@@ -101,7 +81,7 @@ local function buildGUI()
     gui.Parent = PG
 
     mainFrame = Instance.new("Frame")
-    mainFrame.Size = UDim2.new(0, 300, 0, 340)
+    mainFrame.Size = UDim2.new(0, 300, 0, 360)
     mainFrame.Position = UDim2.new(0, 8, 0, 55)
     mainFrame.BackgroundColor3 = Color3.fromRGB(10, 10, 20)
     mainFrame.BackgroundTransparency = 0.1
@@ -119,7 +99,7 @@ local function buildGUI()
 
     local tLabel = Instance.new("TextLabel")
     tLabel.Size = UDim2.new(1, -50, 1, 0); tLabel.Position = UDim2.new(0, 8, 0, 0)
-    tLabel.BackgroundTransparency = 1; tLabel.Text = "SHOT DEBUG v2"
+    tLabel.BackgroundTransparency = 1; tLabel.Text = "SHOT DEBUG v3"
     tLabel.TextColor3 = Color3.fromRGB(255, 150, 100); tLabel.TextSize = 11
     tLabel.Font = Enum.Font.GothamBold; tLabel.TextXAlignment = Enum.TextXAlignment.Left
     tLabel.Parent = titleBar
@@ -179,14 +159,24 @@ local function refreshGUI()
     if not textLabel or not gui or not gui.Enabled then return end
     local lines = {}
 
-    -- OnMap status
+    -- OnMap fix (Cek Character juga)
     local onMap = LP:GetAttribute("OnMap")
+    if onMap == nil and LP.Character then
+        onMap = LP.Character:GetAttribute("OnMap")
+    end
+    local hp = 0
+    if LP.Character then
+        local hum = LP.Character:FindFirstChildOfClass("Humanoid")
+        if hum then hp = math.floor(hum.Health) end
+    end
+
     table.insert(lines, "── STATUS ──")
     table.insert(lines, "OnMap: " .. tostring(onMap))
-    table.insert(lines, "HP: " .. (LP.Character and LP.Character:FindFirstChildOfClass("Humanoid") and
-        math.floor(LP.Character:FindFirstChildOfClass("Humanoid").Health) or "?"))
+    table.insert(lines, "HP: " .. tostring(hp))
+    
+    local fbtn = findFireButton()
+    table.insert(lines, "Fire Btn: " .. (fbtn and (fbtn.Name) or "NOT FOUND"))
 
-    -- Shoot remotes captured
     table.insert(lines, "── SHOOT CAPTURED ──")
     local shootFound = false
     for name, info in pairs(lastCaptures) do
@@ -202,7 +192,6 @@ local function refreshGUI()
         table.insert(lines, "Belum ada. Tembak 3x manual.")
     end
 
-    -- All remotes
     table.insert(lines, "── ALL REMOTES (top 8) ──")
     local names = {}
     for n in pairs(remoteCallCount) do table.insert(names, n) end
@@ -213,7 +202,6 @@ local function refreshGUI()
         table.insert(lines, string.format("%s x%d%s", n, remoteCallCount[n], marker))
     end
 
-    -- Recent 5
     table.insert(lines, "── RECENT (5) ──")
     local start = math.max(1, #recentCalls - 4)
     for i = start, #recentCalls do
@@ -225,7 +213,6 @@ local function refreshGUI()
     textLabel.Text = table.concat(lines, "\n")
 end
 
--- ─── HOOK ────────────────────────────────────────────────────
 local function installHook()
     if hookedNamecall then return true end
     if type(hookmetamethod) ~= "function" then
@@ -253,10 +240,9 @@ local function installHook()
     return true
 end
 
--- ─── PUBLIC API ──────────────────────────────────────────────
 function ShotDebug:Init()
     buildGUI()
-    if installHook() then log("OK", "ShotDebug v2 hook installed") end
+    if installHook() then log("OK", "ShotDebug v3 hook installed") end
     task.spawn(function()
         while gui and gui.Parent do
             task.wait(0.25)
@@ -270,76 +256,6 @@ function ShotDebug:ToggleGUI() if gui then gui.Enabled = not gui.Enabled end end
 function ShotDebug:ClearStats()
     remoteCallCount, recentCalls = {}, {}
     log("INFO", "ShotDebug cleared")
-end
-
-function ShotDebug:GetLastCapture(name)
-    return lastCaptures[name]
-end
-
-function ShotDebug:GetAllRemoteNames()
-    local names = {}
-    for n in pairs(lastCaptures) do table.insert(names, n) end
-    return names
-end
-
--- Cari payload shoot terbaik:
--- Prioritas: Shoot → ReplicateFakeBullet → Fire/Attack → apapun yang shoot-like
-function ShotDebug:GetBestShootPayload()
-    local priority = { "Shoot", "ReplicateFakeBullet", "Fire", "Attack" }
-    for _, n in ipairs(priority) do
-        if lastCaptures[n] then
-            return { name = n, args = lastCaptures[n].args }
-        end
-    end
-    -- Fallback: apapun yang shoot-like
-    for n, info in pairs(lastCaptures) do
-        if isShootLike(n) then
-            return { name = n, args = info.args }
-        end
-    end
-    return nil
-end
-
-function ShotDebug:ReplayShoot()
-    local best = self:GetBestShootPayload()
-    if not best then
-        log("WARN", "ReplayShoot: belum ada payload — tembak 3x manual dulu")
-        return false
-    end
-    local remote
-    local RE = game:GetService("ReplicatedStorage"):FindFirstChild("Events")
-    local REs = RE and RE:FindFirstChild("RemoteEvents")
-    if REs then
-        remote = REs:FindFirstChild(best.name)
-    end
-    if not remote then
-        log("ERR", "ReplayShoot: remote '"..best.name.."' tidak ditemukan")
-        return false
-    end
-    local ok, err = pcall(function()
-        remote:FireServer(table.unpack(best.args))
-    end)
-    if not ok then
-        log("ERR", "ReplayShoot: "..tostring(err))
-        return false
-    end
-    log("OK", "ReplayShoot: fired "..best.name.." n="..#best.args)
-    return true
-end
-
-function ShotDebug:ReplayShootModified(newArgs, remoteName)
-    local best = remoteName and { name = remoteName, args = newArgs }
-        or self:GetBestShootPayload()
-    if not best then return false end
-    local RE = game:GetService("ReplicatedStorage"):FindFirstChild("Events")
-    local REs = RE and RE:FindFirstChild("RemoteEvents")
-    if not REs then return false end
-    local remote = REs:FindFirstChild(best.name)
-    if not remote then return false end
-    local ok = pcall(function()
-        remote:FireServer(table.unpack(newArgs or best.args))
-    end)
-    return ok
 end
 
 function ShotDebug:Destroy()
